@@ -20,10 +20,22 @@ isolated function fetchVersionsFromCentral(string org, string name) returns stri
 }
 
 // Fetches the bala bytes for a package version from Ballerina Central.
-isolated function fetchBalaFromCentral(string org, string name, string version) returns byte[]|error {
+isolated function fetchBalaFromCentral(string org, string name, string version) returns byte[]|http:Response|error {
     http:Response versionMetadataResponse = check centralClient->get(
         string `/2.0/registry/packages/${org}/${name}/${version}`
     );
+
+    if versionMetadataResponse.statusCode == 404 {
+        log:printInfo("Package not found in central", org = org, name = name, version = version);
+        http:Response notFound = new;
+        notFound.statusCode = 404;
+        notFound.setTextPayload(
+            string `Package '${org}/${name}:${version}' does not exist`,
+            contentType = "text/plain"
+        );
+        return notFound;
+    }
+
     json responsePayload = check versionMetadataResponse.getJsonPayload();
     log:printInfo("Fetched version metadata from central", org = org, name = name, version = version, response = responsePayload);
 
@@ -104,16 +116,19 @@ function buildLatestManifestResponse(string org, string name) returns http:Respo
 
 // Builds the OCI manifest for a specific package version from bala bytes.
 function buildVersionManifestResponse(string org, string name, string version) returns http:Response|error {
-    byte[]|error balaBytesResult = fetchBalaFromCentral(org, name, version);
-    if balaBytesResult is error {
-        log:printError("Failed fetching bala from central", 'error = balaBytesResult, org = org, name = name, version = version);
+    byte[]|http:Response|error fetchResult = fetchBalaFromCentral(org, name, version);
+    if fetchResult is http:Response {
+        return fetchResult;
+    }
+    if fetchResult is error {
+        log:printError("Failed fetching bala from central", 'error = fetchResult, org = org, name = name, version = version);
         http:Response errResponse = new;
         errResponse.statusCode = 502;
-        errResponse.setTextPayload("Failed to fetch from central: " + balaBytesResult.message());
+        errResponse.setTextPayload("Failed to fetch from central: " + fetchResult.message());
         return errResponse;
     }
 
-    return buildManifestResponse(balaBytesResult);
+    return buildManifestResponse(fetchResult);
 }
 
 // Converts a byte array to a lowercase hex string
