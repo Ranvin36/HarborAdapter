@@ -3,20 +3,44 @@ import ballerina/crypto;
 import ballerina/log;
 
 // Fetches the list of versions for a package from Ballerina Central
-isolated function fetchVersionsFromCentral(string org, string name) returns string[]|error {
+isolated function fetchVersionsFromCentral(string org, string name) returns string[]|http:Response|error {
     http:Response centralResponse = check centralClient->get(
         string `/2.0/registry/packages/${org}/${name}`
     );
+
+    if centralResponse.statusCode == 404 {
+        log:printInfo("Package not found in central", org = org, name = name);
+        http:Response notFound = new;
+        notFound.statusCode = 404;
+        notFound.setTextPayload(
+            string `Package '${org}/${name}' does not exist`,
+            contentType = "text/plain"
+        );
+        return notFound;
+    }
+
     json responsePayload = check centralResponse.getJsonPayload();
     log:printInfo("Fetched versions from central", org = org, name = name, response = responsePayload);
 
-    // Central may return either a raw JSON array or an object with a `versions` field.
-    if responsePayload is json[] {
-        return check responsePayload.cloneWithType();
+    // Central returns a JSON object with a `message` field when the package is not found.
+    if responsePayload is map<json> {
+        json messageField = responsePayload["message"];
+        if messageField is string {
+            log:printInfo("Package not found in central (message response)", org = org, name = name, centralMessage = messageField);
+            http:Response notFound = new;
+            notFound.statusCode = 404;
+            notFound.setTextPayload(
+                string `Package '${org}/${name}' does not exist`,
+                contentType = "text/plain"
+            );
+            return notFound;
+        }
+        VersionsResponse versionsData = check responsePayload.cloneWithType();
+        return versionsData.versions;
     }
 
-    VersionsResponse versionsData = check responsePayload.cloneWithType();
-    return versionsData.versions;
+    string[] versionList = check responsePayload.cloneWithType();
+    return versionList;
 }
 
 // Fetches the bala bytes for a package version from Ballerina Central.
@@ -102,15 +126,26 @@ function buildManifestResponse(byte[] blobBytes) returns http:Response {
 
 // Builds the OCI manifest for the latest endpoint from the versions JSON payload.
 function buildLatestManifestResponse(string org, string name) returns http:Response|error {
-    string[] versions = check fetchVersionsFromCentral(org, name);
-    if versions.length() == 0 {
+    string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name);
+    if fetchResult is http:Response {
+        return fetchResult;
+    }
+    if fetchResult is error {
+        log:printError("Failed fetching versions from central", 'error = fetchResult, org = org, name = name);
+        http:Response errResponse = new;
+        errResponse.statusCode = 502;
+        errResponse.setTextPayload("Failed to fetch from central: " + fetchResult.message());
+        return errResponse;
+    }
+
+    if fetchResult.length() == 0 {
         http:Response errResponse = new;
         errResponse.statusCode = 502;
         errResponse.setTextPayload("Failed to fetch from central: no versions available");
         return errResponse;
     }
 
-    byte[] versionsBytes = versions.toJsonString().toBytes();
+    byte[] versionsBytes = fetchResult.toJsonString().toBytes();
     return buildManifestResponse(versionsBytes);
 }
 
