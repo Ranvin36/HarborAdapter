@@ -42,19 +42,22 @@ service /v2 on ep {
     }
 
     // GET /v2/{org}/{name}/manifests/{version}
-    resource function get [string org]/[string name]/manifests/[string version]() returns http:Response|error {
+    resource function get [string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
         log:printInfo("Received GET manifest request", org = org, name = name, version = version);
+        logRequestHeaders(req);
         return buildVersionManifestResponse(org, name, version);
     }
 
     // HEAD /v2/{org}/{name}/manifests/{version} — Docker clients probe with HEAD
-    resource function head [string org]/[string name]/manifests/[string version]() returns http:Response|error {
+    resource function head [string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
         log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
+        logRequestHeaders(req);
         return buildVersionManifestResponse(org, name, version);
     }
 
     // HEAD /v2/{org}/{name}/blobs/{digest} — Docker checks blob existence before pulling
     resource function head [string org]/[string name]/blobs/[string... digestParts]() returns http:Response {
+        log:printInfo("Received HEAD request for blob existence check", org = org, name = name, digestParts = digestParts);
         string digest = "";
         foreach string part in digestParts {
             digest = digest == "" ? part : digest + "/" + part;
@@ -75,6 +78,7 @@ service /v2 on ep {
 
     // GET /v2/{org}/{name}/blobs/{digest}
     resource function get [string org]/[string name]/blobs/[string... digestParts]() returns http:Response {
+        log:printInfo("Received HEAD request for blob existence check", org = org, name = name, digestParts = digestParts);
         string digest = "";
         foreach string part in digestParts {
             digest = digest == "" ? part : digest + "/" + part;
