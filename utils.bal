@@ -44,7 +44,8 @@ isolated function fetchVersionsFromCentral(string org, string name) returns stri
 }
 
 // Fetches the bala digest for a package version from Ballerina Central.
-isolated function fetchBalaFromCentral(string org, string name, string version) returns string|http:Response|error {
+// Stores metadata in digestToMetadata for on-demand blob retrieval.
+function fetchBalaFromCentral(string org, string name, string version) returns string|http:Response|error {
     http:Response versionMetadataResponse = check centralClient->get(
         string `/2.0/registry/packages/${org}/${name}/${version}`
     );
@@ -61,7 +62,7 @@ isolated function fetchBalaFromCentral(string org, string name, string version) 
     }
 
     json responsePayload = check versionMetadataResponse.getJsonPayload();
-    log:printInfo("Fetched version metadata from central", org = org, name = name, version = version, response = responsePayload);
+    log:printInfo("Fetched version metadata from central", org = org, name = name, version = version);
 
     map<json> versionData = check responsePayload.cloneWithType();
     string? rawDigest = getStringField(versionData, "digest");
@@ -72,6 +73,24 @@ isolated function fetchBalaFromCentral(string org, string name, string version) 
     // Central returns digest as "sha256=<hex>"; convert to OCI format "sha256:<hex>"
     string digest = re `sha-256=`.replaceAll(rawDigest, "sha256:");
     log:printInfo("Resolved bala digest from central", org = org, name = name, version = version, digest = digest);
+
+    // Resolve the bala download URL
+    string? balaURL = getStringField(versionData, "balaURL");
+    if balaURL is () {
+        balaURL = getStringField(versionData, "balURL");
+    }
+    if balaURL is () {
+        balaURL = getStringField(versionData, "URL");
+    }
+    if balaURL is () {
+        return error("Central version metadata did not contain a balaURL, balURL, or URL field");
+    }
+
+    // Store metadata for on-demand download when the blob is requested
+    BalaMetadata balaMetadata = {org: org, name: name, version: version, balaURL: balaURL};
+    digestToMetadata[digest] = balaMetadata;
+    log:printInfo("Stored bala metadata for on-demand retrieval", digest = digest);
+
     return digest;
 }
 
@@ -107,8 +126,6 @@ function buildManifestResponse(byte[] blobBytes) returns http:Response {
     string hexDigest = bytesToHex(hashBytes);
     string digest = "sha256:" + hexDigest;
     int blobSize = blobBytes.length();
-
-    digestToBlobContent[digest] = blobBytes;
     return buildOciManifest(digest, blobSize);
 }
 
