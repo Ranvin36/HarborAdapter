@@ -7,6 +7,8 @@ final http:Client centralClient = check new ("https://api.central.ballerina.io")
 
 // In-memory store mapping digest -> bala metadata (for on-demand blob retrieval)
 map<BalaMetadata> digestToMetadata = {};
+// In-memory store mapping digest -> raw bytes (for latest/versions blobs)
+map<byte[]> digestToRawBytes = {};
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
 service /v2 on ep {
@@ -63,7 +65,7 @@ service /v2 on ep {
             digest = digest == "" ? part : digest + "/" + part;
         }
         log:printInfo("Received HEAD request for blob", org = org, name = name, digest = digest);
-        if digest == OCI_EMPTY_CONFIG_DIGEST || digestToMetadata.hasKey(digest) {
+        if digest == OCI_EMPTY_CONFIG_DIGEST || digestToMetadata.hasKey(digest) || digestToRawBytes.hasKey(digest) {
             http:Response headResponse = new;
             headResponse.statusCode = 200;
             headResponse.setHeader("Content-Type", "application/octet-stream");
@@ -89,6 +91,17 @@ service /v2 on ep {
             configResponse.statusCode = 200;
             configResponse.setTextPayload("{}", contentType = "application/vnd.oci.image.config.v1+json");
             return configResponse;
+        }
+
+        // Serve raw bytes (e.g. versions JSON from latest endpoint)
+        byte[]? rawBytes = digestToRawBytes[digest];
+        if rawBytes is byte[] {
+            log:printInfo("Serving raw bytes from cache", digest = digest);
+            http:Response rawBlobResponse = new;
+            rawBlobResponse.statusCode = 200;
+            rawBlobResponse.setHeader("Content-Type", "application/octet-stream");
+            rawBlobResponse.setPayload(rawBytes);
+            return rawBlobResponse;
         }
 
         BalaMetadata? metadata = digestToMetadata[digest];

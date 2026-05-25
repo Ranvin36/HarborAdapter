@@ -62,7 +62,7 @@ function fetchBalaFromCentral(string org, string name, string version) returns s
     }
 
     json responsePayload = check versionMetadataResponse.getJsonPayload();
-    log:printInfo("Fetched version metadata from central", org = org, name = name, version = version);
+    log:printInfo("Fetched version metadata from central", org = org, name = name, version = version, response = responsePayload);
 
     map<json> versionData = check responsePayload.cloneWithType();
     string? rawDigest = getStringField(versionData, "digest");
@@ -126,6 +126,8 @@ function buildManifestResponse(byte[] blobBytes) returns http:Response {
     string hexDigest = bytesToHex(hashBytes);
     string digest = "sha256:" + hexDigest;
     int blobSize = blobBytes.length();
+    digestToRawBytes[digest] = blobBytes;
+    log:printInfo("Stored raw bytes for blob retrieval", digest = digest, size = blobSize);
     return buildOciManifest(digest, blobSize);
 }
 
