@@ -58,12 +58,7 @@ service / on ep {
     }
 
     // HEAD /v2/{org}/{name}/blobs/{digest} — Docker checks blob existence before pulling
-    resource function head v2/[string org]/[string name]/blobs/[string... digestParts]() returns http:Response {
-        log:printInfo("Received HEAD request for blob existence check", org = org, name = name, digestParts = digestParts);
-        string digest = "";
-        foreach string part in digestParts {
-            digest = digest == "" ? part : digest + "/" + part;
-        }
+    resource function head v2/[string org]/[string name]/blobs/[string digest]() returns http:Response {
         log:printInfo("Received HEAD request for blob", org = org, name = name, digest = digest);
         if digest == OCI_EMPTY_CONFIG_DIGEST || digestToMetadata.hasKey(digest) || digestToRawBytes.hasKey(digest) {
             http:Response headResponse = new;
@@ -79,11 +74,7 @@ service / on ep {
     }
 
     // GET /v2/{org}/{name}/blobs/{digest}
-    resource function get v2/[string org]/[string name]/blobs/[string... digestParts]() returns http:Response|error {
-        string digest = "";
-        foreach string part in digestParts {
-            digest = digest == "" ? part : digest + "/" + part;
-        }
+    resource function get v2/[string org]/[string name]/blobs/[string digest]() returns http:Response|error {
         log:printInfo("Received request for blob", org = org, name = name, digest = digest);
 
         if digest == OCI_EMPTY_CONFIG_DIGEST {
