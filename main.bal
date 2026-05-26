@@ -11,10 +11,10 @@ map<BalaMetadata> digestToMetadata = {};
 map<byte[]> digestToRawBytes = {};
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
-service /v2 on ep {
+service / on ep {
 
     // GET /v2
-    resource function get .() returns http:Response {
+    resource function get v2() returns http:Response {
         log:printInfo("Received request for /v2/");
         http:Response v2Response = new;
         v2Response.statusCode = 200;
@@ -23,7 +23,7 @@ service /v2 on ep {
     }
 
     // HEAD /v2 — Docker clients probe with HEAD before GET
-    resource function head .() returns http:Response {
+    resource function head v2() returns http:Response {
         log:printInfo("Received HEAD request for /v2/");
         http:Response v2Response = new;
         v2Response.statusCode = 200;
@@ -32,33 +32,33 @@ service /v2 on ep {
     }
 
     // GET /v2/{org}/{name}/manifests/latest
-    resource function get [string org]/[string name]/manifests/latest() returns http:Response|error {
+    resource function get v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
         log:printInfo("Received GET latest manifest request", org = org, name = name);
         return buildLatestManifestResponse(org, name);
     }
 
     // HEAD /v2/{org}/{name}/manifests/latest — Docker clients probe with HEAD
-    resource function head [string org]/[string name]/manifests/latest() returns http:Response|error {
+    resource function head v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
         log:printInfo("Received HEAD latest manifest request", org = org, name = name);
         return buildLatestManifestResponse(org, name);
     }
 
     // GET /v2/{org}/{name}/manifests/{version}
-    resource function get [string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
+    resource function get v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
         log:printInfo("Received GET manifest request", org = org, name = name, version = version);
         logRequestHeaders(req);
         return buildVersionManifestResponse(org, name, version);
     }
 
     // HEAD /v2/{org}/{name}/manifests/{version} — Docker clients probe with HEAD
-    resource function head [string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
+    resource function head v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
         log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
         logRequestHeaders(req);
         return buildVersionManifestResponse(org, name, version);
     }
 
     // HEAD /v2/{org}/{name}/blobs/{digest} — Docker checks blob existence before pulling
-    resource function head [string org]/[string name]/blobs/[string... digestParts]() returns http:Response {
+    resource function head v2/[string org]/[string name]/blobs/[string... digestParts]() returns http:Response {
         log:printInfo("Received HEAD request for blob existence check", org = org, name = name, digestParts = digestParts);
         string digest = "";
         foreach string part in digestParts {
@@ -79,7 +79,7 @@ service /v2 on ep {
     }
 
     // GET /v2/{org}/{name}/blobs/{digest}
-    resource function get [string org]/[string name]/blobs/[string... digestParts]() returns http:Response|error {
+    resource function get v2/[string org]/[string name]/blobs/[string... digestParts]() returns http:Response|error {
         string digest = "";
         foreach string part in digestParts {
             digest = digest == "" ? part : digest + "/" + part;
