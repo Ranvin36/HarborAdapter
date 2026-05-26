@@ -5,10 +5,9 @@ listener http:Listener ep = check new http:Listener(8080);
 
 final http:Client centralClient = check new ("https://api.central.ballerina.io");
 
-// In-memory store mapping digest -> bala metadata (for on-demand blob retrieval)
-map<BalaMetadata> digestToMetadata = {};
-// In-memory store mapping digest -> raw bytes (for latest/versions blobs)
-map<byte[]> digestToRawBytes = {};
+// Isolated in-memory stores — safe for concurrent access
+isolated map<BalaMetadata> digestToMetadata = {};
+isolated map<byte[]> digestToRawBytes = {};
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
 service / on ep {
@@ -58,9 +57,33 @@ service / on ep {
     }
 
     // HEAD /v2/{org}/{name}/blobs/{digest} — Docker checks blob existence before pulling
-    resource function head v2/[string org]/[string name]/blobs/[string digest]() returns http:Response {
+    resource function head v2/[string org]/[string name]/blobs/[string digest]() returns http:Response|error {
         log:printInfo("Received HEAD request for blob", org = org, name = name, digest = digest);
-        if digest == OCI_EMPTY_CONFIG_DIGEST || digestToMetadata.hasKey(digest) || digestToRawBytes.hasKey(digest) {
+        if digest == OCI_EMPTY_CONFIG_DIGEST {
+            http:Response headResponse = new;
+            headResponse.statusCode = 200;
+            headResponse.setHeader("Content-Type", "application/octet-stream");
+            return headResponse;
+        }
+        boolean knownInMetadata;
+        lock {
+            knownInMetadata = digestToMetadata.hasKey(digest);
+        }
+        boolean knownInRaw;
+        lock {
+            knownInRaw = digestToRawBytes.hasKey(digest);
+        }
+        boolean knownDigest = knownInMetadata || knownInRaw;
+        if knownDigest {
+            http:Response headResponse = new;
+            headResponse.statusCode = 200;
+            headResponse.setHeader("Content-Type", "application/octet-stream");
+            return headResponse;
+        }
+        // Digest not in memory — re-fetch metadata from Central to recover
+        log:printInfo("Digest not in memory on HEAD, re-fetching from Central", digest = digest, org = org, name = name);
+        string|http:Response|error fetchResult = fetchBalaFromCentral(org, name, "*");
+        if fetchResult is string && fetchResult == digest {
             http:Response headResponse = new;
             headResponse.statusCode = 200;
             headResponse.setHeader("Content-Type", "application/octet-stream");
@@ -84,8 +107,12 @@ service / on ep {
             return configResponse;
         }
 
-        // Serve raw bytes (e.g. versions JSON from latest endpoint)
-        byte[]? rawBytes = digestToRawBytes[digest];
+        // Check raw bytes cache (versions JSON from latest endpoint)
+        byte[]? rawBytes;
+        lock {
+            byte[]? rawBytesInner = digestToRawBytes[digest];
+            rawBytes = rawBytesInner is byte[] ? rawBytesInner.clone() : ();
+        }
         if rawBytes is byte[] {
             log:printInfo("Serving raw bytes from cache", digest = digest);
             http:Response rawBlobResponse = new;
@@ -95,9 +122,27 @@ service / on ep {
             return rawBlobResponse;
         }
 
-        BalaMetadata? metadata = digestToMetadata[digest];
+        // Check bala metadata cache
+        BalaMetadata? metadata;
+        lock {
+            BalaMetadata? metadataInner = digestToMetadata[digest];
+            metadata = metadataInner is BalaMetadata ? metadataInner.clone() : ();
+        }
+
+        // Metadata missing (e.g. different pod served the manifest) — re-fetch from Central
         if metadata is () {
-            log:printInfo("Digest not found in memory map", digest = digest);
+            log:printInfo("Digest not in memory, re-fetching metadata from Central", digest = digest, org = org, name = name);
+            string|http:Response|error fetchResult = fetchBalaFromCentral(org, name, "*");
+            if fetchResult is string {
+                lock {
+                    BalaMetadata? refetched = digestToMetadata[digest];
+                    metadata = refetched is BalaMetadata ? refetched.clone() : ();
+                }
+            }
+        }
+
+        if metadata is () {
+            log:printInfo("Digest not found after re-fetch attempt", digest = digest);
             http:Response notFound = new;
             notFound.statusCode = 404;
             notFound.setTextPayload("{\"errors\":[{\"code\":\"BLOB_UNKNOWN\"}]}", contentType = "application/json");
@@ -114,13 +159,16 @@ service / on ep {
             http:Client balaClient = check new (metadata.balaURL);
             http:Response balaResponse = check balaClient->get("");
             balaBytes = check balaResponse.getBinaryPayload();
-            digestToMetadata[digest] = {
+            BalaMetadata updatedMetadata = {
                 org: metadata.org,
                 name: metadata.name,
                 version: metadata.version,
                 balaURL: metadata.balaURL,
-                cachedBytes: balaBytes
+                cachedBytes: balaBytes.clone()
             };
+            lock {
+                digestToMetadata[digest] = updatedMetadata.clone();
+            }
             log:printInfo("Cached bala bytes for future requests", digest = digest, size = balaBytes.length());
         }
 

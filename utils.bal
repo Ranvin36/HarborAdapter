@@ -88,7 +88,9 @@ function fetchBalaFromCentral(string org, string name, string version) returns s
 
     // Store metadata for on-demand download when the blob is requested
     BalaMetadata balaMetadata = {org: org, name: name, version: version, balaURL: balaURL};
-    digestToMetadata[digest] = balaMetadata;
+    lock {
+        digestToMetadata[digest] = balaMetadata.clone();
+    }
     log:printInfo("Stored bala metadata for on-demand retrieval", digest = digest);
 
     return digest;
@@ -126,7 +128,9 @@ function buildManifestResponse(byte[] blobBytes) returns http:Response {
     string hexDigest = bytesToHex(hashBytes);
     string digest = "sha256:" + hexDigest;
     int blobSize = blobBytes.length();
-    digestToRawBytes[digest] = blobBytes;
+    lock {
+        digestToRawBytes[digest] = blobBytes.clone();
+    }
     log:printInfo("Stored raw bytes for blob retrieval", digest = digest, size = blobSize);
     return buildOciManifest(digest, blobSize);
 }
