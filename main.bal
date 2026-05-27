@@ -1,5 +1,7 @@
 import ballerina/http;
 import ballerina/log;
+import ballerina/task;
+import ballerina/time;
 
 
 final http:Client centralClient = check new ("https://api.central.ballerina.io");
@@ -7,9 +9,49 @@ final http:Client centralClient = check new ("https://api.central.ballerina.io")
 // Isolated in-memory stores — safe for concurrent access
 isolated map<BalaMetadata> digestToMetadata = {};
 isolated map<byte[]> digestToRawBytes = {};
+// Tracks last access time (Unix seconds) per digest for TTL-based eviction
+isolated map<decimal> digestLastAccessed = {};
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+final decimal DIGEST_TTL_SECONDS = 10;
 
-service / on new http:Listener(9090) {
+// Background job that evicts digests idle for more than DIGEST_TTL_SECONDS
+class DigestEvictionJob {
+    *task:Job;
+    public function execute() {
+        decimal nowSeconds = time:monotonicNow();
+        map<decimal> snapshot = {};
+        lock {
+            snapshot = digestLastAccessed.clone();
+        }
+        string[] toEvict = from string digest in snapshot.keys()
+                           where nowSeconds - snapshot.get(digest) > DIGEST_TTL_SECONDS
+                           select digest;
+        foreach string digest in toEvict {
+            lock {
+                _ = digestToMetadata.removeIfHasKey(digest);
+            }
+            lock {
+                _ = digestToRawBytes.removeIfHasKey(digest);
+            }
+            lock {
+                _ = digestLastAccessed.removeIfHasKey(digest);
+            }
+            log:printInfo("Evicted idle digest from memory", digest = digest);
+        }
+    }
+}
+
+// Touch the last-accessed timestamp for a digest
+function touchDigest(string digest) {
+    lock {
+        digestLastAccessed[digest] = time:monotonicNow();
+    }
+}
+
+// Start the eviction job — runs every 5 seconds, checks for 10s idle digests
+final task:JobId evictionJobId = check task:scheduleJobRecurByFrequency(new DigestEvictionJob(), 5);
+
+service / on new http:Listener(8080) {
     // GET /v2
     resource function get v2() returns http:Response {
         log:printInfo("Received request for /v2/");
@@ -103,6 +145,7 @@ service / on new http:Listener(9090) {
             rawBytes = rawBytesInner is byte[] ? rawBytesInner.clone() : ();
         }
         if rawBytes is byte[] {
+            touchDigest(digest);
             log:printInfo("Serving raw bytes from cache", digest = digest);
             http:Response rawBlobResponse = new;
             rawBlobResponse.statusCode = 200;
@@ -141,6 +184,7 @@ service / on new http:Listener(9090) {
         byte[] balaBytes;
         byte[]? cached = metadata.cachedBytes;
         if cached is byte[] {
+            touchDigest(digest);
             log:printInfo("Serving bala bytes from cache", digest = digest);
             balaBytes = cached;
         } else {
@@ -158,6 +202,7 @@ service / on new http:Listener(9090) {
             lock {
                 digestToMetadata[digest] = updatedMetadata.clone();
             }
+            touchDigest(digest);
             log:printInfo("Cached bala bytes for future requests", digest = digest, size = balaBytes.length());
         }
 

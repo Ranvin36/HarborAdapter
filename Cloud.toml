@@ -1,5 +1,5 @@
 [container.image]
-repository="wso2inc" # Docker hub name
+repository="ranvin07" # Docker hub name
 name="harbor-adapter" # container name
 tag="v0.1.0"
 
