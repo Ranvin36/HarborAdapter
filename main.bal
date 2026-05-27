@@ -10,8 +10,6 @@ final http:Client centralClient = check new ("https://api.central.ballerina.io")
 // Isolated in-memory stores — safe for concurrent access
 isolated map<BalaMetadata> digestToMetadata = {};
 isolated map<byte[]> digestToRawBytes = {};
-// Classifies each digest as VERSIONS or BALA for targeted re-fetch on cache miss
-isolated map<DigestType> digestTypeMap = {};
 // Tracks last access time (Unix seconds) per digest for TTL-based eviction
 isolated map<decimal> digestLastAccessed = {};
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
@@ -35,9 +33,6 @@ class DigestEvictionJob {
             }
             lock {
                 _ = digestToRawBytes.removeIfHasKey(digest);
-            }
-            lock {
-                _ = digestTypeMap.removeIfHasKey(digest);
             }
             lock {
                 _ = digestLastAccessed.removeIfHasKey(digest);
@@ -144,60 +139,50 @@ service / on new http:Listener(8080) {
             return configResponse;
         }
 
-        // Determine digest type to route to the correct re-fetch path
-        DigestType? digestType;
+        // Check raw bytes cache (versions JSON from latest endpoint)
+        byte[]? rawBytes;
         lock {
-            digestType = digestTypeMap[digest];
+            byte[]? rawBytesInner = digestToRawBytes[digest];
+            rawBytes = rawBytesInner is byte[] ? rawBytesInner.clone() : ();
         }
-
-        if digestType == VERSIONS {
-            // Serve versions JSON bytes
-            byte[]? rawBytes;
-            lock {
-                byte[]? rawBytesInner = digestToRawBytes[digest];
-                rawBytes = rawBytesInner is byte[] ? rawBytesInner.clone() : ();
-            }
-            if rawBytes is () {
-                log:printInfo("Versions bytes not in memory, re-fetching from Central", digest = digest, org = org, name = name);
-                string[]|http:Response|error versionsResult = fetchVersionsFromCentral(org, name);
-                if versionsResult is string[] && versionsResult.length() > 0 {
-                    byte[] rebuiltBytes = versionsResult.toJsonString().toBytes();
-                    byte[] hashBytes = crypto:hashSha256(rebuiltBytes);
-                    string rebuiltDigest = "sha256:" + bytesToHex(hashBytes);
-                    if rebuiltDigest == digest {
-                        lock {
-                            digestToRawBytes[digest] = rebuiltBytes.clone();
-                        }
-                        touchDigest(digest);
-                        rawBytes = rebuiltBytes;
-                        log:printInfo("Rebuilt and cached versions bytes", digest = digest);
+        // Raw bytes missing — re-fetch versions from Central and rebuild
+        if rawBytes is () {
+            log:printInfo("Raw bytes not in memory, re-fetching versions from Central", digest = digest, org = org, name = name);
+            string[]|http:Response|error versionsResult = fetchVersionsFromCentral(org, name);
+            if versionsResult is string[] && versionsResult.length() > 0 {
+                byte[] rebuiltBytes = versionsResult.toJsonString().toBytes();
+                byte[] hashBytes = crypto:hashSha256(rebuiltBytes);
+                string rebuiltDigest = "sha256:" + bytesToHex(hashBytes);
+                if rebuiltDigest == digest {
+                    lock {
+                        digestToRawBytes[digest] = rebuiltBytes.clone();
                     }
+                    touchDigest(digest);
+                    rawBytes = rebuiltBytes;
+                    log:printInfo("Rebuilt and cached versions bytes", digest = digest);
                 }
             }
-            if rawBytes is byte[] {
-                touchDigest(digest);
-                log:printInfo("Serving versions bytes", digest = digest);
-                http:Response rawBlobResponse = new;
-                rawBlobResponse.statusCode = 200;
-                rawBlobResponse.setHeader("Content-Type", "application/octet-stream");
-                rawBlobResponse.setPayload(rawBytes);
-                return rawBlobResponse;
-            }
-            log:printInfo("Versions bytes not found after re-fetch", digest = digest);
-            http:Response notFound = new;
-            notFound.statusCode = 404;
-            notFound.setTextPayload("{\"errors\":[{\"code\":\"BLOB_UNKNOWN\"}]}", contentType = "application/json");
-            return notFound;
+        }
+        if rawBytes is byte[] {
+            touchDigest(digest);
+            log:printInfo("Serving raw bytes from cache", digest = digest);
+            http:Response rawBlobResponse = new;
+            rawBlobResponse.statusCode = 200;
+            rawBlobResponse.setHeader("Content-Type", "application/octet-stream");
+            rawBlobResponse.setPayload(rawBytes);
+            return rawBlobResponse;
         }
 
-        // BALA path (digestType == BALA or unknown)
+        // Check bala metadata cache
         BalaMetadata? metadata;
         lock {
             BalaMetadata? metadataInner = digestToMetadata[digest];
             metadata = metadataInner is BalaMetadata ? metadataInner.clone() : ();
         }
+
+        // Metadata missing (e.g. different pod served the manifest) — re-fetch from Central
         if metadata is () {
-            log:printInfo("Bala metadata not in memory, re-fetching from Central", digest = digest, org = org, name = name);
+            log:printInfo("Digest not in memory, re-fetching metadata from Central", digest = digest, org = org, name = name);
             string|http:Response|error fetchResult = fetchBalaFromCentral(org, name, "*");
             if fetchResult is string {
                 lock {
@@ -206,6 +191,7 @@ service / on new http:Listener(8080) {
                 }
             }
         }
+
         if metadata is () {
             log:printInfo("Digest not found after re-fetch attempt", digest = digest);
             http:Response notFound = new;

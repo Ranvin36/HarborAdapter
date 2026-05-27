@@ -91,9 +91,6 @@ function fetchBalaFromCentral(string org, string name, string version) returns s
     lock {
         digestToMetadata[digest] = balaMetadata.clone();
     }
-    lock {
-        digestTypeMap[digest] = BALA;
-    }
     touchDigest(digest);
     log:printInfo("Stored bala metadata for on-demand retrieval", digest = digest);
 
@@ -134,9 +131,6 @@ function buildManifestResponse(byte[] blobBytes) returns http:Response {
     int blobSize = blobBytes.length();
     lock {
         digestToRawBytes[digest] = blobBytes.clone();
-    }
-    lock {
-        digestTypeMap[digest] = VERSIONS;
     }
     touchDigest(digest);
     log:printInfo("Stored raw bytes for blob retrieval", digest = digest, size = blobSize);
