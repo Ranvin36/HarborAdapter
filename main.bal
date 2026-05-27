@@ -1,7 +1,6 @@
 import ballerina/http;
 import ballerina/log;
 
-listener http:Listener ep = check new http:Listener(8080);
 
 final http:Client centralClient = check new ("https://api.central.ballerina.io");
 
@@ -10,20 +9,10 @@ isolated map<BalaMetadata> digestToMetadata = {};
 isolated map<byte[]> digestToRawBytes = {};
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
-service / on ep {
-
+service / on new http:Listener(9090) {
     // GET /v2
     resource function get v2() returns http:Response {
         log:printInfo("Received request for /v2/");
-        http:Response v2Response = new;
-        v2Response.statusCode = 200;
-        v2Response.setHeader("Docker-Distribution-API-Version", "2.0");
-        return v2Response;
-    }
-
-    // HEAD /v2 — Docker clients probe with HEAD before GET
-    resource function head v2() returns http:Response {
-        log:printInfo("Received HEAD request for /v2/");
         http:Response v2Response = new;
         v2Response.statusCode = 200;
         v2Response.setHeader("Docker-Distribution-API-Version", "2.0");

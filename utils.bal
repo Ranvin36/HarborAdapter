@@ -62,7 +62,7 @@ function fetchBalaFromCentral(string org, string name, string version) returns s
     }
 
     json responsePayload = check versionMetadataResponse.getJsonPayload();
-    log:printInfo("Fetched version metadata from central", org = org, name = name, version = version, response = responsePayload);
+    log:printInfo("Fetched version metadata from central", org = org, name = name, version = version);
 
     map<json> versionData = check responsePayload.cloneWithType();
     string? rawDigest = getStringField(versionData, "digest");
