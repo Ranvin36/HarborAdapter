@@ -2,52 +2,6 @@ import ballerina/http;
 import ballerina/crypto;
 import ballerina/log;
 
-// Encodes a plain ASCII string to hex and pads with trailing zeros to 64 chars.
-isolated function encodeDigest(string key) returns string {
-    byte[] keyBytes = key.toBytes();
-    string hexChars = "0123456789abcdef";
-    string hexEncoded = "";
-    foreach byte b in keyBytes {
-        int highNibble = (b & 0xF0) >> 4;
-        int lowNibble = b & 0x0F;
-        hexEncoded = hexEncoded + hexChars.substring(highNibble, highNibble + 1)
-                                + hexChars.substring(lowNibble, lowNibble + 1);
-    }
-    // Pad with trailing zeros to exactly 64 hex characters
-    int padLength = 64 - hexEncoded.length();
-    string padding = "";
-    foreach int i in 0 ..< padLength {
-        padding = padding + "0";
-    }
-    return "sha256:" + hexEncoded + padding;
-}
-
-// Decodes a padded hex digest back to the original ASCII key string.
-isolated function decodeDigest(string digest) returns string|error {
-    // Strip "sha256:" prefix
-    string hexPadded = digest.substring(7);
-    // Trim trailing zeros (padding) by finding the last non-zero character
-    int lastNonZero = hexPadded.length() - 1;
-    while lastNonZero >= 0 && hexPadded.substring(lastNonZero, lastNonZero + 1) == "0" {
-        lastNonZero = lastNonZero - 1;
-    }
-    string hexStr = hexPadded.substring(0, lastNonZero + 1);
-    // Ensure even length for byte decoding
-    if hexStr.length() % 2 != 0 {
-        hexStr = hexStr + "0";
-    }
-    // Decode hex pairs back to bytes
-    byte[] resultBytes = [];
-    int idx = 0;
-    while idx < hexStr.length() {
-        string hexPair = hexStr.substring(idx, idx + 2);
-        int byteVal = check int:fromHexString(hexPair);
-        resultBytes.push(<byte>byteVal);
-        idx = idx + 2;
-    }
-    return check string:fromBytes(resultBytes);
-}
-
 // Converts a byte array to a lowercase hex string.
 isolated function bytesToHex(byte[] input) returns string {
     string hexChars = "0123456789abcdef";
@@ -232,7 +186,56 @@ function buildLatestManifestResponse(string org, string name) returns http:Respo
     return buildOciManifest(digest, versionsBytes.length());
 }
 
-// Builds the OCI manifest for a bala package.
+// Fetches only the digest for a package version from Ballerina Central (no bala download).
+isolated function fetchVersionDigestFromCentral(string org, string name, string version) returns string|http:Response|error {
+    http:Response versionMetadataResponse = check centralClient->get(
+        string `/2.0/registry/packages/${org}/${name}/${version}`
+    );
+
+    if versionMetadataResponse.statusCode == 404 {
+        log:printInfo("Package not found in central", org = org, name = name, version = version);
+        http:Response notFound = new;
+        notFound.statusCode = 404;
+        notFound.setTextPayload(string `Package '${org}/${name}:${version}' does not exist`, contentType = "text/plain");
+        return notFound;
+    }
+
+    json responsePayload = check versionMetadataResponse.getJsonPayload();
+    map<json> versionData = check responsePayload.cloneWithType();
+
+    string? rawDigest = getStringField(versionData, "digest");
+    if rawDigest is () {
+        return error("Central version metadata did not contain a digest field");
+    }
+
+    // Central returns "sha256=<hex>"; convert to OCI format "sha256:<hex>"
+    string ociDigest = re `sha256=`.replaceAll(rawDigest, "sha256:");
+    log:printInfo("Fetched version digest from central", org = org, name = name, version = version, digest = ociDigest);
+    return ociDigest;
+}
+
+// Builds the OCI manifest for a bala package (HEAD — digest only, no bala download).
+function buildVersionManifestHeadResponse(string org, string name, string version) returns http:Response|error {
+    string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
+    if digestResult is http:Response {
+        return digestResult;
+    }
+    if digestResult is error {
+        log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
+        http:Response errResponse = new;
+        errResponse.statusCode = 502;
+        errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
+        return errResponse;
+    }
+
+    lock {
+        blobSources[digestResult] = string `${org}/${name}/${version}`;
+    }
+    log:printInfo("Built HEAD version manifest", org = org, name = name, version = version, digest = digestResult);
+    return buildOciManifest(digestResult, 0);
+}
+
+// Builds the OCI manifest for a bala package (GET — downloads bala, computes real digest and size).
 function buildVersionManifestResponse(string org, string name, string version) returns http:Response|error {
     byte[]|http:Response|error balaResult = fetchBalaFromCentral(org, name, version);
     if balaResult is http:Response {

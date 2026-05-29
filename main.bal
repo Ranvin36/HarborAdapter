@@ -51,7 +51,7 @@ service / on new http:Listener(8080) {
     // HEAD /v2/{org}/{name}/manifests/{version}
     resource function head v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
         log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
-        return buildVersionManifestResponse(org, name, version);
+        return buildVersionManifestHeadResponse(org, name, version);
     }
 
     // HEAD /v2/{org}/{name}/blobs/{digest}
@@ -90,6 +90,7 @@ service / on new http:Listener(8080) {
         string? sourceKey;
         lock {
             sourceKey = blobSources[digest];
+            log:printInfo("Source key for digest " ,sourceKey = sourceKey);
         }
         if sourceKey is () {
             log:printError("Unknown blob digest", digest = digest);
