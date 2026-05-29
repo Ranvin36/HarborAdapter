@@ -1,7 +1,9 @@
 import ballerina/http;
 import ballerina/log;
 
-final http:Client centralClient = check new ("https://api.central.ballerina.io");
+final http:Client centralClient = check new ("https://api.central.ballerina.io",{
+    timeout: 5
+});
 
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
@@ -11,7 +13,6 @@ isolated map<byte[]> blobCache = {};
 isolated map<string> blobSources = {};
 
 service / on new http:Listener(8080) {
-
     // GET /v2
     resource function get v2() returns http:Response {
         log:printInfo("Received request for /v2/");
@@ -44,14 +45,12 @@ service / on new http:Listener(8080) {
     // GET /v2/{org}/{name}/manifests/{version}
     resource function get v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
         log:printInfo("Received GET manifest request", org = org, name = name, version = version);
-        logRequestHeaders(req);
         return buildVersionManifestResponse(org, name, version);
     }
 
     // HEAD /v2/{org}/{name}/manifests/{version}
     resource function head v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
         log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
-        logRequestHeaders(req);
         return buildVersionManifestResponse(org, name, version);
     }
 

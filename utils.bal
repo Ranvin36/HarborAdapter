@@ -3,7 +3,6 @@ import ballerina/crypto;
 import ballerina/log;
 
 // Encodes a plain ASCII string to hex and pads with trailing zeros to 64 chars.
-// Format: sha256:<hex-encoded-key><trailing-zeros>
 isolated function encodeDigest(string key) returns string {
     byte[] keyBytes = key.toBytes();
     string hexChars = "0123456789abcdef";
@@ -145,6 +144,7 @@ isolated function fetchBalaFromCentral(string org, string name, string version) 
     }
 
     // Split balaURL into base (scheme + host) and path+query to avoid client mishandling presigned URLs
+
     int? pathStart = balaURL.indexOf("/", 8); // skip "https://"
     string balaBase;
     string balaPath;
@@ -156,7 +156,7 @@ isolated function fetchBalaFromCentral(string org, string name, string version) 
         balaPath = "/";
     }
 
-    http:Client balaClient = check new (balaBase);
+    http:Client balaClient = check new (balaBase, {timeout: 50});
     http:Response balaResponse = check balaClient->get(balaPath);
     byte[] balaBytes = check balaResponse.getBinaryPayload();
     log:printInfo("Fetched bala bytes", org = org, name = name, version = version, size = balaBytes.length());
@@ -175,21 +175,21 @@ isolated function getStringField(map<json> data, string fieldName) returns strin
 // Builds and returns the OCI manifest HTTP response.
 isolated function buildOciManifest(string digest, int layerSize) returns http:Response {
     string ociManifest = string `{
-  "schemaVersion": 2,
-  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-  "config": {
-    "mediaType": "application/vnd.oci.image.config.v1+json",
-    "size": 2,
-    "digest": "${OCI_EMPTY_CONFIG_DIGEST}"
-  },
-  "layers": [
-    {
-      "mediaType": "application/vnd.ballerina.index.layer.v1+json",
-      "size": ${layerSize},
-      "digest": "${digest}"
-    }
-  ]
-}`;
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": 2,
+            "digest": "${OCI_EMPTY_CONFIG_DIGEST}"
+        },
+        "layers": [
+            {
+            "mediaType": "application/vnd.ballerina.index.layer.v1+json",
+            "size": ${layerSize},
+            "digest": "${digest}"
+            }
+        ]
+    }`;
 
     http:Response manifestResponse = new;
     manifestResponse.statusCode = 200;
@@ -200,8 +200,7 @@ isolated function buildOciManifest(string digest, int layerSize) returns http:Re
     return manifestResponse;
 }
 
-// Builds the OCI manifest for the latest endpoint.
-// Digest encodes "org/name" so the blob endpoint can decode and re-fetch.
+// Builds the OCI manifest for the package versions.
 function buildLatestManifestResponse(string org, string name) returns http:Response|error {
     string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name);
     if fetchResult is http:Response {
@@ -233,8 +232,7 @@ function buildLatestManifestResponse(string org, string name) returns http:Respo
     return buildOciManifest(digest, versionsBytes.length());
 }
 
-// Builds the OCI manifest for a specific version.
-// Digest encodes "org/name/version" so the blob endpoint can decode and re-fetch.
+// Builds the OCI manifest for a bala package.
 function buildVersionManifestResponse(string org, string name, string version) returns http:Response|error {
     byte[]|http:Response|error balaResult = fetchBalaFromCentral(org, name, version);
     if balaResult is http:Response {
@@ -257,21 +255,4 @@ function buildVersionManifestResponse(string org, string name, string version) r
     }
     log:printInfo("Built version manifest", org = org, name = name, version = version, digest = digest, size = balaResult.length());
     return buildOciManifest(digest, balaResult.length());
-}
-
-// Logs all headers from an incoming request.
-function logRequestHeaders(http:Request req) {
-    string[] headerNames = req.getHeaderNames();
-    foreach string headerName in headerNames {
-        string|http:HeaderNotFoundError headerValue = req.getHeader(headerName);
-        if headerValue is string {
-            log:printInfo("Request header", headerName = headerName, headerValue = headerValue);
-        }
-    }
-    string|http:HeaderNotFoundError ifNoneMatch = req.getHeader("If-None-Match");
-    if ifNoneMatch is string {
-        log:printInfo("If-None-Match header", ifNoneMatch = ifNoneMatch);
-    } else {
-        log:printInfo("If-None-Match header not present");
-    }
 }
