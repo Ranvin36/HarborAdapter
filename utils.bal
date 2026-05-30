@@ -2,7 +2,38 @@ import ballerina/http;
 import ballerina/crypto;
 import ballerina/log;
 
-// Fetches the list of versions for a package from Ballerina Central
+// Converts a byte array to a lowercase hex string.
+isolated function bytesToHex(byte[] input) returns string {
+    string hexChars = "0123456789abcdef";
+    string hexEncoded = "";
+    foreach byte b in input {
+        int highNibble = (b & 0xF0) >> 4;
+        int lowNibble = b & 0x0F;
+        hexEncoded = hexEncoded + hexChars.substring(highNibble, highNibble + 1)
+                                + hexChars.substring(lowNibble, lowNibble + 1);
+    }
+    return hexEncoded;
+}
+
+// Computes a content-addressable OCI digest for a blob.
+isolated function computeSha256Digest(byte[] content) returns string {
+    byte[] digestBytes = crypto:hashSha256(content);
+    return "sha256:" + bytesToHex(digestBytes);
+}
+
+// Builds a blob response with OCI-friendly headers.
+isolated function buildBlobResponse(byte[] content, string digest, string contentType) returns http:Response {
+    http:Response blobResponse = new;
+    blobResponse.statusCode = 200;
+    blobResponse.setHeader("Content-Type", contentType);
+    blobResponse.setHeader("Docker-Content-Digest", digest);
+    blobResponse.setHeader("ETag", "\"" + digest + "\"");
+    blobResponse.setHeader("Content-Length", content.length().toString());
+    blobResponse.setBinaryPayload(content);
+    return blobResponse;
+}
+
+// Fetches the list of versions for a package from Ballerina Central.
 isolated function fetchVersionsFromCentral(string org, string name) returns string[]|http:Response|error {
     http:Response centralResponse = check centralClient->get(
         string `/2.0/registry/packages/${org}/${name}`
@@ -12,10 +43,7 @@ isolated function fetchVersionsFromCentral(string org, string name) returns stri
         log:printInfo("Package not found in central", org = org, name = name);
         http:Response notFound = new;
         notFound.statusCode = 404;
-        notFound.setTextPayload(
-            string `Package '${org}/${name}' does not exist`,
-            contentType = "text/plain"
-        );
+        notFound.setTextPayload(string `Package '${org}/${name}' does not exist`, contentType = "text/plain");
         return notFound;
     }
 
@@ -29,10 +57,7 @@ isolated function fetchVersionsFromCentral(string org, string name) returns stri
             log:printInfo("Package not found in central (message response)", org = org, name = name, centralMessage = messageField);
             http:Response notFound = new;
             notFound.statusCode = 404;
-            notFound.setTextPayload(
-                string `Package '${org}/${name}' does not exist`,
-                contentType = "text/plain"
-            );
+            notFound.setTextPayload(string `Package '${org}/${name}' does not exist`, contentType = "text/plain");
             return notFound;
         }
         VersionsResponse versionsData = check responsePayload.cloneWithType();
@@ -43,9 +68,8 @@ isolated function fetchVersionsFromCentral(string org, string name) returns stri
     return versionList;
 }
 
-// Fetches the bala digest for a package version from Ballerina Central.
-// Stores metadata in digestToMetadata for on-demand blob retrieval.
-function fetchBalaFromCentral(string org, string name, string version) returns string|http:Response|error {
+// Fetches the bala bytes for a specific package version from Ballerina Central.
+isolated function fetchBalaFromCentral(string org, string name, string version) returns byte[]|http:Response|error {
     http:Response versionMetadataResponse = check centralClient->get(
         string `/2.0/registry/packages/${org}/${name}/${version}`
     );
@@ -54,27 +78,14 @@ function fetchBalaFromCentral(string org, string name, string version) returns s
         log:printInfo("Package not found in central", org = org, name = name, version = version);
         http:Response notFound = new;
         notFound.statusCode = 404;
-        notFound.setTextPayload(
-            string `Package '${org}/${name}:${version}' does not exist`,
-            contentType = "text/plain"
-        );
+        notFound.setTextPayload(string `Package '${org}/${name}:${version}' does not exist`, contentType = "text/plain");
         return notFound;
     }
 
     json responsePayload = check versionMetadataResponse.getJsonPayload();
-    log:printInfo("Fetched version metadata from central", org = org, name = name, version = version);
+    log:printInfo("Fetched metadata from central", org = org, name = name, version = version);
 
     map<json> versionData = check responsePayload.cloneWithType();
-    string? rawDigest = getStringField(versionData, "digest");
-    if rawDigest is () {
-        return error("Central version metadata did not contain a digest field");
-    }
-
-    // Central returns digest as "sha256=<hex>"; convert to OCI format "sha256:<hex>"
-    string digest = re `sha-256=`.replaceAll(rawDigest, "sha256:");
-    log:printInfo("Resolved bala digest from central", org = org, name = name, version = version, digest = digest);
-
-    // Resolve the bala download URL
     string? balaURL = getStringField(versionData, "balaURL");
     if balaURL is () {
         balaURL = getStringField(versionData, "balURL");
@@ -86,32 +97,24 @@ function fetchBalaFromCentral(string org, string name, string version) returns s
         return error("Central version metadata did not contain a balaURL, balURL, or URL field");
     }
 
-    // Store metadata for on-demand download when the blob is requested
-    BalaMetadata balaMetadata = {org: org, name: name, version: version, balaURL: balaURL};
-    lock {
-        digestToMetadata[digest] = balaMetadata.clone();
-    }
-    touchDigest(digest);
-    log:printInfo("Stored bala metadata for on-demand retrieval", digest = digest);
+    // Split balaURL into base (scheme + host) and path+query to avoid client mishandling presigned URLs
 
-    return digest;
-}
-
-// Logs all headers from an incoming request, highlighting If-None-Match.
-function logRequestHeaders(http:Request req) {
-    string[] headerNames = req.getHeaderNames();
-    foreach string headerName in headerNames {
-        string|http:HeaderNotFoundError headerValue = req.getHeader(headerName);
-        if headerValue is string {
-            log:printInfo("Request header", headerName = headerName, headerValue = headerValue);
-        }
-    }
-    string|http:HeaderNotFoundError ifNoneMatch = req.getHeader("If-None-Match");
-    if ifNoneMatch is string {
-        log:printInfo("If-None-Match header", ifNoneMatch = ifNoneMatch);
+    int? pathStart = balaURL.indexOf("/", 8); // skip "https://"
+    string balaBase;
+    string balaPath;
+    if pathStart is int {
+        balaBase = balaURL.substring(0, pathStart);
+        balaPath = balaURL.substring(pathStart);
     } else {
-        log:printInfo("If-None-Match header not present");
+        balaBase = balaURL;
+        balaPath = "/";
     }
+
+    http:Client balaClient = check new (balaBase, {timeout: 50});
+    http:Response balaResponse = check balaClient->get(balaPath);
+    byte[] balaBytes = check balaResponse.getBinaryPayload();
+    log:printInfo("Fetched bala bytes", org = org, name = name, version = version, size = balaBytes.length());
+    return balaBytes;
 }
 
 // Reads a string field from a JSON object if it exists.
@@ -123,43 +126,24 @@ isolated function getStringField(map<json> data, string fieldName) returns strin
     return ();
 }
 
-// Builds the OCI manifest response for a given blob payload (used by latest endpoint).
-function buildManifestResponse(byte[] blobBytes) returns http:Response {
-    byte[] hashBytes = crypto:hashSha256(blobBytes);
-    string hexDigest = bytesToHex(hashBytes);
-    string digest = "sha256:" + hexDigest;
-    int blobSize = blobBytes.length();
-    lock {
-        digestToRawBytes[digest] = blobBytes.clone();
-    }
-    touchDigest(digest);
-    log:printInfo("Stored raw bytes for blob retrieval", digest = digest, size = blobSize);
-    return buildOciManifest(digest, blobSize);
-}
-
-// Builds the OCI manifest response using a pre-computed digest (used by version endpoint).
-function buildManifestResponseFromDigest(string digest) returns http:Response {
-    return buildOciManifest(digest, 0);
-}
-
-// Constructs and returns the OCI manifest HTTP response.
-function buildOciManifest(string digest, int layerSize) returns http:Response {
+// Builds and returns the OCI manifest HTTP response.
+isolated function buildOciManifest(string digest, int layerSize) returns http:Response {
     string ociManifest = string `{
-  "schemaVersion": 2,
-  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-  "config": {
-    "mediaType": "application/vnd.oci.image.config.v1+json",
-    "size": 2,
-    "digest": "${OCI_EMPTY_CONFIG_DIGEST}"
-  },
-  "layers": [
-    {
-      "mediaType": "application/vnd.ballerina.index.layer.v1+json",
-      "size": ${layerSize},
-      "digest": "${digest}"
-    }
-  ]
-}`;
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": 2,
+            "digest": "${OCI_EMPTY_CONFIG_DIGEST}"
+        },
+        "layers": [
+            {
+            "mediaType": "application/vnd.ballerina.index.layer.v1+json",
+            "size": ${layerSize},
+            "digest": "${digest}"
+            }
+        ]
+    }`;
 
     http:Response manifestResponse = new;
     manifestResponse.statusCode = 200;
@@ -170,7 +154,7 @@ function buildOciManifest(string digest, int layerSize) returns http:Response {
     return manifestResponse;
 }
 
-// Builds the OCI manifest for the latest endpoint from the versions JSON payload.
+// Builds the OCI manifest for the package versions.
 function buildLatestManifestResponse(string org, string name) returns http:Response|error {
     string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name);
     if fetchResult is http:Response {
@@ -183,44 +167,74 @@ function buildLatestManifestResponse(string org, string name) returns http:Respo
         errResponse.setTextPayload("Failed to fetch from central: " + fetchResult.message());
         return errResponse;
     }
-
     if fetchResult.length() == 0 {
         http:Response errResponse = new;
         errResponse.statusCode = 502;
-        errResponse.setTextPayload("Failed to fetch from central: no versions available");
+        errResponse.setTextPayload("No versions available for package");
         return errResponse;
     }
 
     byte[] versionsBytes = fetchResult.toJsonString().toBytes();
-    return buildManifestResponse(versionsBytes);
+    string digest = computeSha256Digest(versionsBytes);
+    lock {
+        blobCache[digest] = versionsBytes.clone();
+    }
+    lock {
+        blobSources[digest] = string `${org}/${name}`;
+    }
+    log:printInfo("Built latest manifest", org = org, name = name, digest = digest);
+    return buildOciManifest(digest, versionsBytes.length());
 }
 
-// Builds the OCI manifest for a specific package version using the digest from Central.
-function buildVersionManifestResponse(string org, string name, string version) returns http:Response|error {
-    string|http:Response|error fetchResult = fetchBalaFromCentral(org, name, version);
-    if fetchResult is http:Response {
-        return fetchResult;
+// Fetches only the digest for a package version from Ballerina Central (no bala download).
+isolated function fetchVersionDigestFromCentral(string org, string name, string version) returns string|http:Response|error {
+    http:Response versionMetadataResponse = check centralClient->get(
+        string `/2.0/registry/packages/${org}/${name}/${version}`
+    );
+
+    if versionMetadataResponse.statusCode == 404 {
+        log:printInfo("Package not found in central", org = org, name = name, version = version);
+        http:Response notFound = new;
+        notFound.statusCode = 404;
+        notFound.setTextPayload(string `Package '${org}/${name}:${version}' does not exist`, contentType = "text/plain");
+        return notFound;
     }
-    if fetchResult is error {
-        log:printError("Failed fetching bala digest from central", 'error = fetchResult, org = org, name = name, version = version);
+
+    json responsePayload = check versionMetadataResponse.getJsonPayload();
+    map<json> versionData = check responsePayload.cloneWithType();
+
+    string? rawDigest = getStringField(versionData, "digest");
+    if rawDigest is () {
+        return error("Central version metadata did not contain a digest field");
+    }
+
+    // Central returns "sha256=<hex>"; convert to OCI format "sha256:<hex>"
+    string ociDigest = re `sha256=`.replaceAll(rawDigest, "sha256:");
+    log:printInfo("Fetched version digest from central", org = org, name = name, version = version, digest = ociDigest);
+    return ociDigest;
+}
+
+// Builds the OCI manifest for a bala package (GET — downloads bala, computes real digest and size).
+function buildVersionManifestResponse(string org, string name, string version) returns http:Response|error {
+    byte[]|http:Response|error balaResult = fetchBalaFromCentral(org, name, version);
+    if balaResult is http:Response {
+        return balaResult;
+    }
+    if balaResult is error {
+        log:printError("Failed fetching bala for manifest", 'error = balaResult, org = org, name = name, version = version);
         http:Response errResponse = new;
         errResponse.statusCode = 502;
-        errResponse.setTextPayload("Failed to fetch from central: " + fetchResult.message());
+        errResponse.setTextPayload("Failed to fetch bala: " + balaResult.message());
         return errResponse;
     }
 
-    return buildManifestResponseFromDigest(fetchResult);
-}
-
-// Converts a byte array to a lowercase hex string
-isolated function bytesToHex(byte[] bytes) returns string {
-    string hexChars = "0123456789abcdef";
-    string result = "";
-    foreach byte b in bytes {
-        int highNibble = (b & 0xF0) >> 4;
-        int lowNibble = b & 0x0F;
-        result = result + hexChars.substring(highNibble, highNibble + 1)
-                        + hexChars.substring(lowNibble, lowNibble + 1);
+    string digest = computeSha256Digest(balaResult);
+    lock {
+        blobCache[digest] = balaResult.clone();
     }
-    return result;
+    lock {
+        blobSources[digest] = string `${org}/${name}/${version}`;
+    }
+    log:printInfo("Built version manifest", org = org, name = name, version = version, digest = digest, size = balaResult.length());
+    return buildOciManifest(digest, balaResult.length());
 }

@@ -1,61 +1,29 @@
-import ballerina/crypto;
 import ballerina/http;
 import ballerina/log;
-import ballerina/task;
-import ballerina/time;
 
+final http:Client centralClient = check new ("https://api.central.ballerina.io",{
+    timeout: 5
+});
 
-final http:Client centralClient = check new ("https://api.central.ballerina.io");
-
-// Isolated in-memory stores — safe for concurrent access
-isolated map<BalaMetadata> digestToMetadata = {};
-isolated map<byte[]> digestToRawBytes = {};
-// Tracks last access time (Unix seconds) per digest for TTL-based eviction
-isolated map<decimal> digestLastAccessed = {};
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
-final decimal DIGEST_TTL_SECONDS = 10;
 
-// Background job that evicts digests idle for more than DIGEST_TTL_SECONDS
-class DigestEvictionJob {
-    *task:Job;
-    public function execute() {
-        decimal nowSeconds = time:monotonicNow();
-        map<decimal> snapshot = {};
-        lock {
-            snapshot = digestLastAccessed.clone();
-        }
-        string[] toEvict = from string digest in snapshot.keys()
-                           where nowSeconds - snapshot.get(digest) > DIGEST_TTL_SECONDS
-                           select digest;
-        foreach string digest in toEvict {
-            lock {
-                _ = digestToMetadata.removeIfHasKey(digest);
-            }
-            lock {
-                _ = digestToRawBytes.removeIfHasKey(digest);
-            }
-            lock {
-                _ = digestLastAccessed.removeIfHasKey(digest);
-            }
-            log:printInfo("Evicted idle digest from memory", digest = digest);
-        }
-    }
-}
-
-// Touch the last-accessed timestamp for a digest
-function touchDigest(string digest) {
-    lock {
-        digestLastAccessed[digest] = time:monotonicNow();
-    }
-}
-
-// Start the eviction job — runs every 5 seconds, checks for 10s idle digests
-final task:JobId evictionJobId = check task:scheduleJobRecurByFrequency(new DigestEvictionJob(), 5);
+// Blob cache: digest -> bytes, populated on first fetch and reused on subsequent requests
+isolated map<byte[]> blobCache = {};
+// Blob source lookup: digest -> "org/name" or "org/name/version"
+isolated map<string> blobSources = {};
 
 service / on new http:Listener(8080) {
     // GET /v2
     resource function get v2() returns http:Response {
         log:printInfo("Received request for /v2/");
+        http:Response v2Response = new;
+        v2Response.statusCode = 200;
+        v2Response.setHeader("Docker-Distribution-API-Version", "2.0");
+        return v2Response;
+    }
+
+    // HEAD /v2
+    resource function head v2() returns http:Response {
         http:Response v2Response = new;
         v2Response.statusCode = 200;
         v2Response.setHeader("Docker-Distribution-API-Version", "2.0");
@@ -68,7 +36,7 @@ service / on new http:Listener(8080) {
         return buildLatestManifestResponse(org, name);
     }
 
-    // HEAD /v2/{org}/{name}/manifests/latest — Docker clients probe with HEAD
+    // HEAD /v2/{org}/{name}/manifests/latest
     resource function head v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
         log:printInfo("Received HEAD latest manifest request", org = org, name = name);
         return buildLatestManifestResponse(org, name);
@@ -77,55 +45,40 @@ service / on new http:Listener(8080) {
     // GET /v2/{org}/{name}/manifests/{version}
     resource function get v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
         log:printInfo("Received GET manifest request", org = org, name = name, version = version);
-        logRequestHeaders(req);
         return buildVersionManifestResponse(org, name, version);
     }
 
-    // HEAD /v2/{org}/{name}/manifests/{version} — Docker clients probe with HEAD
-    resource function head v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
+    // HEAD /v2/{org}/{name}/manifests/{version}
+    resource function head v2/[string org]/[string name]/manifests/[string version]() returns http:Response|error {
         log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
-        logRequestHeaders(req);
-        return buildVersionManifestResponse(org, name, version);
+        string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
+        if digestResult is http:Response {
+            return digestResult;
+        }
+        if digestResult is error {
+            log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
+            http:Response errResponse = new;
+            errResponse.statusCode = 502;
+            errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
+            return errResponse;
+        }
+        http:Response headResponse = new;
+        headResponse.statusCode = 200;
+        headResponse.setHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json");
+        headResponse.setHeader("Docker-Content-Digest", digestResult);
+        headResponse.setHeader("ETag", "\"" + digestResult + "\"");
+        return headResponse;
     }
 
-    // HEAD /v2/{org}/{name}/blobs/{digest} — Docker checks blob existence before pulling
-    resource function head v2/[string org]/[string name]/blobs/[string digest]() returns http:Response|error {
+    // HEAD /v2/{org}/{name}/blobs/{digest}
+    resource function head v2/[string org]/[string name]/blobs/[string digest]() returns http:Response {
         log:printInfo("Received HEAD request for blob", org = org, name = name, digest = digest);
-        if digest == OCI_EMPTY_CONFIG_DIGEST {
-            http:Response headResponse = new;
-            headResponse.statusCode = 200;
-            headResponse.setHeader("Content-Type", "application/octet-stream");
-            return headResponse;
-        }
-        boolean knownInMetadata;
-        lock {
-            knownInMetadata = digestToMetadata.hasKey(digest);
-        }
-        boolean knownInRaw;
-        lock {
-            knownInRaw = digestToRawBytes.hasKey(digest);
-        }
-        boolean knownDigest = knownInMetadata || knownInRaw;
-        if knownDigest {
-            http:Response headResponse = new;
-            headResponse.statusCode = 200;
-            headResponse.setHeader("Content-Type", "application/octet-stream");
-            return headResponse;
-        }
-        // Digest not in memory — re-fetch metadata from Central to recover
-        log:printInfo("Digest not in memory on HEAD, re-fetching from Central", digest = digest, org = org, name = name);
-        string|http:Response|error fetchResult = fetchBalaFromCentral(org, name, "*");
-        if fetchResult is string && fetchResult == digest {
-            http:Response headResponse = new;
-            headResponse.statusCode = 200;
-            headResponse.setHeader("Content-Type", "application/octet-stream");
-            return headResponse;
-        }
-        http:Response notFound = new;
-        notFound.statusCode = 404;
-        notFound.setHeader("Content-Type", "application/json");
-        notFound.setTextPayload("{\"errors\":[{\"code\":\"BLOB_UNKNOWN\"}]}", contentType = "application/json");
-        return notFound;
+        // All digests we issue are valid — always acknowledge existence
+        http:Response headResponse = new;
+        headResponse.statusCode = 200;
+        headResponse.setHeader("Content-Type", "application/octet-stream");
+        headResponse.setHeader("Docker-Content-Digest", digest);
+        return headResponse;
     }
 
     // GET /v2/{org}/{name}/blobs/{digest}
@@ -139,96 +92,96 @@ service / on new http:Listener(8080) {
             return configResponse;
         }
 
-        // Check raw bytes cache (versions JSON from latest endpoint)
-        byte[]? rawBytes;
+        // Return from cache if already fetched
+        byte[]? cachedBlob;
         lock {
-            byte[]? rawBytesInner = digestToRawBytes[digest];
-            rawBytes = rawBytesInner is byte[] ? rawBytesInner.clone() : ();
+            byte[]? inner = blobCache[digest];
+            cachedBlob = inner is byte[] ? inner.clone() : ();
         }
-        // Raw bytes missing — re-fetch versions from Central and rebuild
-        if rawBytes is () {
-            log:printInfo("Raw bytes not in memory, re-fetching versions from Central", digest = digest, org = org, name = name);
-            string[]|http:Response|error versionsResult = fetchVersionsFromCentral(org, name);
-            if versionsResult is string[] && versionsResult.length() > 0 {
-                byte[] rebuiltBytes = versionsResult.toJsonString().toBytes();
-                byte[] hashBytes = crypto:hashSha256(rebuiltBytes);
-                string rebuiltDigest = "sha256:" + bytesToHex(hashBytes);
-                if rebuiltDigest == digest {
-                    lock {
-                        digestToRawBytes[digest] = rebuiltBytes.clone();
-                    }
-                    touchDigest(digest);
-                    rawBytes = rebuiltBytes;
-                    log:printInfo("Rebuilt and cached versions bytes", digest = digest);
-                }
-            }
-        }
-        if rawBytes is byte[] {
-            touchDigest(digest);
-            log:printInfo("Serving raw bytes from cache", digest = digest);
-            http:Response rawBlobResponse = new;
-            rawBlobResponse.statusCode = 200;
-            rawBlobResponse.setHeader("Content-Type", "application/octet-stream");
-            rawBlobResponse.setPayload(rawBytes);
-            return rawBlobResponse;
+        if cachedBlob is byte[] {
+            log:printInfo("Serving blob from cache", digest = digest);
+            return buildBlobResponse(cachedBlob, digest, "application/octet-stream");
         }
 
-        // Check bala metadata cache
-        BalaMetadata? metadata;
+        string? sourceKey;
         lock {
-            BalaMetadata? metadataInner = digestToMetadata[digest];
-            metadata = metadataInner is BalaMetadata ? metadataInner.clone() : ();
+            sourceKey = blobSources[digest];
+            log:printInfo("Source key for digest " ,sourceKey = sourceKey);
         }
-
-        // Metadata missing (e.g. different pod served the manifest) — re-fetch from Central
-        if metadata is () {
-            log:printInfo("Digest not in memory, re-fetching metadata from Central", digest = digest, org = org, name = name);
-            string|http:Response|error fetchResult = fetchBalaFromCentral(org, name, "*");
-            if fetchResult is string {
-                lock {
-                    BalaMetadata? refetched = digestToMetadata[digest];
-                    metadata = refetched is BalaMetadata ? refetched.clone() : ();
-                }
-            }
-        }
-
-        if metadata is () {
-            log:printInfo("Digest not found after re-fetch attempt", digest = digest);
+        if sourceKey is () {
+            log:printError("Unknown blob digest", digest = digest);
             http:Response notFound = new;
             notFound.statusCode = 404;
             notFound.setTextPayload("{\"errors\":[{\"code\":\"BLOB_UNKNOWN\"}]}", contentType = "application/json");
             return notFound;
         }
 
-        byte[] balaBytes;
-        byte[]? cached = metadata.cachedBytes;
-        if cached is byte[] {
-            touchDigest(digest);
-            log:printInfo("Serving bala bytes from cache", digest = digest);
-            balaBytes = cached;
-        } else {
-            log:printInfo("Fetching bala bytes on demand", digest = digest, org = metadata.org, name = metadata.name, version = metadata.version);
-            http:Client balaClient = check new (metadata.balaURL);
-            http:Response balaResponse = check balaClient->get("");
-            balaBytes = check balaResponse.getBinaryPayload();
-            BalaMetadata updatedMetadata = {
-                org: metadata.org,
-                name: metadata.name,
-                version: metadata.version,
-                balaURL: metadata.balaURL,
-                cachedBytes: balaBytes.clone()
-            };
-            lock {
-                digestToMetadata[digest] = updatedMetadata.clone();
-            }
-            touchDigest(digest);
-            log:printInfo("Cached bala bytes for future requests", digest = digest, size = balaBytes.length());
-        }
+        string[] parts = re `/`.split(sourceKey);
 
-        http:Response blobResponse = new;
-        blobResponse.statusCode = 200;
-        blobResponse.setHeader("Content-Type", "application/octet-stream");
-        blobResponse.setPayload(balaBytes);
-        return blobResponse;
+        if parts.length() == 2 {
+            // "org/name" — serve versions JSON
+            string decodedOrg = parts[0];
+            string decodedName = parts[1];
+            log:printInfo("Serving versions blob", org = decodedOrg, name = decodedName);
+
+            string[]|http:Response|error versionsResult = fetchVersionsFromCentral(decodedOrg, decodedName);
+            if versionsResult is http:Response {
+                return versionsResult;
+            }
+            if versionsResult is error {
+                log:printError("Failed fetching versions", 'error = versionsResult);
+                http:Response errResponse = new;
+                errResponse.statusCode = 502;
+                errResponse.setTextPayload("Failed to fetch versions: " + versionsResult.message());
+                return errResponse;
+            }
+
+            byte[] versionsBytes = versionsResult.toJsonString().toBytes();
+            string versionsDigest = computeSha256Digest(versionsBytes);
+            lock {
+                blobCache[versionsDigest] = versionsBytes.clone();
+            }
+            lock {
+                blobSources[versionsDigest] = sourceKey;
+            }
+            log:printInfo("Cached versions blob", digest = versionsDigest, size = versionsBytes.length());
+            return buildBlobResponse(versionsBytes, versionsDigest, "application/octet-stream");
+
+        } else if parts.length() == 3 {
+            // "org/name/version" — serve bala bytes
+            string decodedOrg = parts[0];
+            string decodedName = parts[1];
+            string decodedVersion = parts[2];
+            log:printInfo("Serving bala blob", org = decodedOrg, name = decodedName, version = decodedVersion);
+
+            byte[]|http:Response|error balaResult = fetchBalaFromCentral(decodedOrg, decodedName, decodedVersion);
+            if balaResult is http:Response {
+                return balaResult;
+            }
+            if balaResult is error {
+                log:printError("Failed fetching bala", 'error = balaResult);
+                http:Response errResponse = new;
+                errResponse.statusCode = 502;
+                errResponse.setTextPayload("Failed to fetch bala: " + balaResult.message());
+                return errResponse;
+            }
+
+            string balaDigest = computeSha256Digest(balaResult);
+            lock {
+                blobCache[balaDigest] = balaResult.clone();
+            }
+            lock {
+                blobSources[balaDigest] = sourceKey;
+            }
+            log:printInfo("Cached bala blob", digest = balaDigest, size = balaResult.length());
+            return buildBlobResponse(balaResult, balaDigest, "application/octet-stream");
+
+        } else {
+            log:printError("Unexpected blob source format", sourceKey = sourceKey);
+            http:Response notFound = new;
+            notFound.statusCode = 404;
+            notFound.setTextPayload("{\"errors\":[{\"code\":\"BLOB_UNKNOWN\"}]}", contentType = "application/json");
+            return notFound;
+        }
     }
 }
