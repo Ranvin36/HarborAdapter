@@ -214,27 +214,6 @@ isolated function fetchVersionDigestFromCentral(string org, string name, string 
     return ociDigest;
 }
 
-// Builds the OCI manifest for a bala package (HEAD — digest only, no bala download).
-function buildVersionManifestHeadResponse(string org, string name, string version) returns http:Response|error {
-    string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
-    if digestResult is http:Response {
-        return digestResult;
-    }
-    if digestResult is error {
-        log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
-        http:Response errResponse = new;
-        errResponse.statusCode = 502;
-        errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
-        return errResponse;
-    }
-
-    lock {
-        blobSources[digestResult] = string `${org}/${name}/${version}`;
-    }
-    log:printInfo("Built HEAD version manifest", org = org, name = name, version = version, digest = digestResult);
-    return buildOciManifest(digestResult, 0);
-}
-
 // Builds the OCI manifest for a bala package (GET — downloads bala, computes real digest and size).
 function buildVersionManifestResponse(string org, string name, string version) returns http:Response|error {
     byte[]|http:Response|error balaResult = fetchBalaFromCentral(org, name, version);

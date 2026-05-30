@@ -49,9 +49,25 @@ service / on new http:Listener(8080) {
     }
 
     // HEAD /v2/{org}/{name}/manifests/{version}
-    resource function head v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
+    resource function head v2/[string org]/[string name]/manifests/[string version]() returns http:Response|error {
         log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
-        return buildVersionManifestHeadResponse(org, name, version);
+        string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
+        if digestResult is http:Response {
+            return digestResult;
+        }
+        if digestResult is error {
+            log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
+            http:Response errResponse = new;
+            errResponse.statusCode = 502;
+            errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
+            return errResponse;
+        }
+        http:Response headResponse = new;
+        headResponse.statusCode = 200;
+        headResponse.setHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json");
+        headResponse.setHeader("Docker-Content-Digest", digestResult);
+        headResponse.setHeader("ETag", "\"" + digestResult + "\"");
+        return headResponse;
     }
 
     // HEAD /v2/{org}/{name}/blobs/{digest}
