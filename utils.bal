@@ -176,12 +176,8 @@ function buildLatestManifestResponse(string org, string name) returns http:Respo
 
     byte[] versionsBytes = fetchResult.toJsonString().toBytes();
     string digest = computeSha256Digest(versionsBytes);
-    lock {
-        blobCache[digest] = versionsBytes.clone();
-    }
-    lock {
-        blobSources[digest] = string `${org}/${name}`;
-    }
+    _ = check blobCache.put(digest, versionsBytes, -1);
+    _ = check blobSources.put(digest, string `${org}/${name}`, -1);
     log:printInfo("Built latest manifest", org = org, name = name, digest = digest);
     return buildOciManifest(digest, versionsBytes.length());
 }
@@ -229,12 +225,8 @@ function buildVersionManifestResponse(string org, string name, string version) r
     }
 
     string digest = computeSha256Digest(balaResult);
-    lock {
-        blobCache[digest] = balaResult.clone();
-    }
-    lock {
-        blobSources[digest] = string `${org}/${name}/${version}`;
-    }
+    _ = check blobCache.put(digest, balaResult, -1);
+    _ = check blobSources.put(digest, string `${org}/${name}/${version}`, -1);
     log:printInfo("Built version manifest", org = org, name = name, version = version, digest = digest, size = balaResult.length());
     return buildOciManifest(digest, balaResult.length());
 }

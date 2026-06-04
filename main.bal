@@ -1,3 +1,4 @@
+import ballerina/cache;
 import ballerina/http;
 import ballerina/log;
 
@@ -7,10 +8,10 @@ final http:Client centralClient = check new ("https://api.central.ballerina.io",
 
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
-// Blob cache: digest -> bytes, populated on first fetch and reused on subsequent requests
-isolated map<byte[]> blobCache = {};
-// Blob source lookup: digest -> "org/name" or "org/name/version"
-isolated map<string> blobSources = {};
+// Blob cache: digest -> bytes, TTL 10 min, max 200 entries
+final cache:Cache blobCache = new (capacity = 200, evictionFactor = 0.2, defaultMaxAge = 600, cleanupInterval = 60);
+// Blob source lookup: digest -> "org/name" or "org/name/version", TTL 10 min
+final cache:Cache blobSources = new (capacity = 500, evictionFactor = 0.2, defaultMaxAge = 600, cleanupInterval = 60);
 
 service / on new http:Listener(8080) {
     // GET /v2
@@ -93,21 +94,17 @@ service / on new http:Listener(8080) {
         }
 
         // Return from cache if already fetched
-        byte[]? cachedBlob;
-        lock {
-            byte[]? inner = blobCache[digest];
-            cachedBlob = inner is byte[] ? inner.clone() : ();
-        }
-        if cachedBlob is byte[] {
+        if blobCache.hasKey(digest) {
+            byte[] cachedBlob = <byte[]> check blobCache.get(digest);
             log:printInfo("Serving blob from cache", digest = digest);
             return buildBlobResponse(cachedBlob, digest, "application/octet-stream");
         }
 
-        string? sourceKey;
-        lock {
-            sourceKey = blobSources[digest];
-            log:printInfo("Source key for digest " ,sourceKey = sourceKey);
+        string? sourceKey = ();
+        if blobSources.hasKey(digest) {
+            sourceKey = <string> check blobSources.get(digest);
         }
+        log:printInfo("Source key for digest", sourceKey = sourceKey);
         if sourceKey is () {
             log:printError("Unknown blob digest", digest = digest);
             http:Response notFound = new;
@@ -138,12 +135,8 @@ service / on new http:Listener(8080) {
 
             byte[] versionsBytes = versionsResult.toJsonString().toBytes();
             string versionsDigest = computeSha256Digest(versionsBytes);
-            lock {
-                blobCache[versionsDigest] = versionsBytes.clone();
-            }
-            lock {
-                blobSources[versionsDigest] = sourceKey;
-            }
+            _ = check blobCache.put(versionsDigest, versionsBytes, -1);
+            _ = check blobSources.put(versionsDigest, sourceKey, -1);
             log:printInfo("Cached versions blob", digest = versionsDigest, size = versionsBytes.length());
             return buildBlobResponse(versionsBytes, versionsDigest, "application/octet-stream");
 
@@ -167,12 +160,8 @@ service / on new http:Listener(8080) {
             }
 
             string balaDigest = computeSha256Digest(balaResult);
-            lock {
-                blobCache[balaDigest] = balaResult.clone();
-            }
-            lock {
-                blobSources[balaDigest] = sourceKey;
-            }
+            _ = check blobCache.put(balaDigest, balaResult, -1);
+            _ = check blobSources.put(balaDigest, sourceKey, -1);
             log:printInfo("Cached bala blob", digest = balaDigest, size = balaResult.length());
             return buildBlobResponse(balaResult, balaDigest, "application/octet-stream");
 
