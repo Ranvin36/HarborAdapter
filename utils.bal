@@ -68,8 +68,8 @@ isolated function fetchVersionsFromCentral(string org, string name) returns stri
     return versionList;
 }
 
-// Fetches the bala bytes for a specific package version from Ballerina Central.
-isolated function fetchBalaFromCentral(string org, string name, string version) returns byte[]|http:Response|error {
+// Resolves the balaURL for a specific package version from Ballerina Central metadata.
+isolated function resolveBalaURL(string org, string name, string version) returns string|http:Response|error {
     http:Response versionMetadataResponse = check centralClient->get(
         string `/2.0/registry/packages/${org}/${name}/${version}`
     );
@@ -96,9 +96,12 @@ isolated function fetchBalaFromCentral(string org, string name, string version) 
     if balaURL is () {
         return error("Central version metadata did not contain a balaURL, balURL, or URL field");
     }
+    return balaURL;
+}
 
-    // Split balaURL into base (scheme + host) and path+query to avoid client mishandling presigned URLs
-
+// Downloads bala bytes from a presigned CDN URL.
+isolated function downloadBalaBytes(string balaURL) returns byte[]|error {
+    // Split into base (scheme + host) and path+query — preserves presigned query params
     int? pathStart = balaURL.indexOf("/", 8); // skip "https://"
     string balaBase;
     string balaPath;
@@ -109,10 +112,24 @@ isolated function fetchBalaFromCentral(string org, string name, string version) 
         balaBase = balaURL;
         balaPath = "/";
     }
-
     http:Client balaClient = check new (balaBase, {timeout: 50});
     http:Response balaResponse = check balaClient->get(balaPath);
-    byte[] balaBytes = check balaResponse.getBinaryPayload();
+    return check balaResponse.getBinaryPayload();
+}
+
+// Fetches the bala bytes for a specific package version from Ballerina Central.
+isolated function fetchBalaFromCentral(string org, string name, string version) returns byte[]|http:Response|error {
+    string|http:Response|error balaURLResult = resolveBalaURL(org, name, version);
+    if balaURLResult is http:Response {
+        return balaURLResult;
+    }
+    if balaURLResult is error {
+        return balaURLResult;
+    }
+    byte[]|error balaBytes = downloadBalaBytes(balaURLResult);
+    if balaBytes is error {
+        return balaBytes;
+    }
     log:printInfo("Fetched bala bytes", org = org, name = name, version = version, size = balaBytes.length());
     return balaBytes;
 }
@@ -205,28 +222,43 @@ isolated function fetchVersionDigestFromCentral(string org, string name, string 
     }
 
     // Central returns "sha256=<hex>"; convert to OCI format "sha256:<hex>"
-    string ociDigest = re `sha256=`.replaceAll(rawDigest, "sha256:");
+    string ociDigest = re `sha-256=`.replaceAll(rawDigest, "sha256:");
     log:printInfo("Fetched version digest from central", org = org, name = name, version = version, digest = ociDigest);
     return ociDigest;
 }
 
-// Builds the OCI manifest for a bala package (GET — downloads bala, computes real digest and size).
+// Builds the OCI manifest for a bala package (GET — uses Central digest, defers bala download to blob request).
 function buildVersionManifestResponse(string org, string name, string version) returns http:Response|error {
-    byte[]|http:Response|error balaResult = fetchBalaFromCentral(org, name, version);
-    if balaResult is http:Response {
-        return balaResult;
+    // Resolve balaURL and store it — bala bytes downloaded only when blob is requested
+    string|http:Response|error balaURLResult = resolveBalaURL(org, name, version);
+    if balaURLResult is http:Response {
+        return balaURLResult;
     }
-    if balaResult is error {
-        log:printError("Failed fetching bala for manifest", 'error = balaResult, org = org, name = name, version = version);
+    if balaURLResult is error {
+        log:printError("Failed resolving balaURL", 'error = balaURLResult, org = org, name = name, version = version);
         http:Response errResponse = new;
         errResponse.statusCode = 502;
-        errResponse.setTextPayload("Failed to fetch bala: " + balaResult.message());
+        errResponse.setTextPayload("Failed to resolve bala URL: " + balaURLResult.message());
         return errResponse;
     }
 
-    string digest = computeSha256Digest(balaResult);
-    _ = check blobCache.put(digest, balaResult, -1);
-    _ = check blobSources.put(digest, string `${org}/${name}/${version}`, -1);
-    log:printInfo("Built version manifest", org = org, name = name, version = version, digest = digest, size = balaResult.length());
-    return buildOciManifest(digest, balaResult.length());
+    // Use Central's digest field directly — no bala download needed at manifest time
+    string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
+    if digestResult is http:Response {
+        return digestResult;
+    }
+    if digestResult is error {
+        log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
+        http:Response errResponse = new;
+        errResponse.statusCode = 502;
+        errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
+        return errResponse;
+    }
+
+    // Cache the balaURL so the blob endpoint can download on demand
+    _ = check blobSources.put(digestResult, string `${org}/${name}/${version}`, -1);
+    // Also store the balaURL keyed by a lookup key for the blob handler
+    _ = check blobSources.put(string `url:${digestResult}`, balaURLResult, -1);
+    log:printInfo("Built version manifest", org = org, name = name, version = version, digest = digestResult);
+    return buildOciManifest(digestResult, 0);
 }

@@ -45,7 +45,19 @@ service / on new http:Listener(8080) {
     // HEAD /v2/{org}/{name}/manifests/latest
     resource function head v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
         log:printInfo("Received HEAD latest manifest request", org = org, name = name);
-        return buildLatestManifestResponse(org, name);
+        // For HEAD, build the manifest to get the digest but return headers only
+        http:Response|error manifestResponse = buildLatestManifestResponse(org, name);
+        if manifestResponse is error {
+            return manifestResponse;
+        }
+        string|http:HeaderNotFoundError digestHeader = manifestResponse.getHeader("Docker-Content-Digest");
+        string digest = digestHeader is string ? digestHeader : "";
+        http:Response headResponse = new;
+        headResponse.statusCode = 200;
+        headResponse.setHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json");
+        headResponse.setHeader("Docker-Content-Digest", digest);
+        headResponse.setHeader("ETag", "\"" + digest + "\"");
+        return headResponse;
     }
 
     // GET /v2/{org}/{name}/manifests/{version}
@@ -100,7 +112,8 @@ service / on new http:Listener(8080) {
 
         // Return from cache if already fetched
         if blobCache.hasKey(digest) {
-            byte[] cachedBlob = <byte[]> check blobCache.get(digest);
+            // Clone to avoid sharing mutable byte[] reference across concurrent requests
+            byte[] cachedBlob = (<byte[]> check blobCache.get(digest)).clone();
             log:printInfo("Serving blob from cache", digest = digest);
             return buildBlobResponse(cachedBlob, digest, "application/octet-stream");
         }
@@ -152,23 +165,42 @@ service / on new http:Listener(8080) {
             string decodedVersion = parts[2];
             log:printInfo("Serving bala blob", org = decodedOrg, name = decodedName, version = decodedVersion);
 
-            byte[]|http:Response|error balaResult = fetchBalaFromCentral(decodedOrg, decodedName, decodedVersion);
-            if balaResult is http:Response {
-                return balaResult;
+            // Use cached balaURL if available (set by buildVersionManifestResponse)
+            string balaURL;
+            string urlKey = string `url:${digest}`;
+            if blobSources.hasKey(urlKey) {
+                balaURL = <string> check blobSources.get(urlKey);
+                log:printInfo("Using cached balaURL", digest = digest);
+            } else {
+                // Fall back to re-fetching metadata from Central
+                string|http:Response|error balaURLResult = resolveBalaURL(decodedOrg, decodedName, decodedVersion);
+                if balaURLResult is http:Response {
+                    return balaURLResult;
+                }
+                if balaURLResult is error {
+                    log:printError("Failed resolving balaURL", 'error = balaURLResult);
+                    http:Response errResponse = new;
+                    errResponse.statusCode = 502;
+                    errResponse.setTextPayload("Failed to resolve bala URL: " + balaURLResult.message());
+                    return errResponse;
+                }
+                balaURL = balaURLResult;
             }
-            if balaResult is error {
-                log:printError("Failed fetching bala", 'error = balaResult);
+
+            byte[]|error balaBytes = downloadBalaBytes(balaURL);
+            if balaBytes is error {
+                log:printError("Failed downloading bala", 'error = balaBytes);
                 http:Response errResponse = new;
                 errResponse.statusCode = 502;
-                errResponse.setTextPayload("Failed to fetch bala: " + balaResult.message());
+                errResponse.setTextPayload("Failed to download bala: " + balaBytes.message());
                 return errResponse;
             }
 
-            string balaDigest = computeSha256Digest(balaResult);
-            _ = check blobCache.put(balaDigest, balaResult, -1);
+            string balaDigest = computeSha256Digest(balaBytes);
+            _ = check blobCache.put(balaDigest, balaBytes, -1);
             _ = check blobSources.put(balaDigest, sourceKey, -1);
-            log:printInfo("Cached bala blob", digest = balaDigest, size = balaResult.length());
-            return buildBlobResponse(balaResult, balaDigest, "application/octet-stream");
+            log:printInfo("Cached bala blob", digest = balaDigest, size = balaBytes.length());
+            return buildBlobResponse(balaBytes, balaDigest, "application/octet-stream");
 
         } else {
             log:printError("Unexpected blob source format", sourceKey = sourceKey);
