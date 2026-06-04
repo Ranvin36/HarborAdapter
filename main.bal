@@ -2,8 +2,13 @@ import ballerina/cache;
 import ballerina/http;
 import ballerina/log;
 
-final http:Client centralClient = check new ("https://api.central.ballerina.io",{
-    timeout: 5
+final http:Client centralClient = check new ("https://api.central.ballerina.io", {
+    timeout: 30,
+    poolConfig: {
+        maxActiveConnections: 100,
+        maxIdleConnections: 20,
+        waitTime: 30
+    }
 });
 
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
