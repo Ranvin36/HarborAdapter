@@ -173,28 +173,40 @@ isolated function buildOciManifest(string digest, int layerSize) returns http:Re
 
 // Builds the OCI manifest for the package versions.
 function buildLatestManifestResponse(string org, string name) returns http:Response|error {
-    string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name);
-    if fetchResult is http:Response {
-        return fetchResult;
-    }
-    if fetchResult is error {
-        log:printError("Failed fetching versions from central", 'error = fetchResult, org = org, name = name);
-        http:Response errResponse = new;
-        errResponse.statusCode = 502;
-        errResponse.setTextPayload("Failed to fetch from central: " + fetchResult.message());
-        return errResponse;
-    }
-    if fetchResult.length() == 0 {
-        http:Response errResponse = new;
-        errResponse.statusCode = 502;
-        errResponse.setTextPayload("No versions available for package");
-        return errResponse;
+    string listKey = string `${org}/${name}`;
+    byte[] versionsBytes;
+
+    if versionsListCache.hasKey(listKey) {
+        string cachedJson = <string> check versionsListCache.get(listKey);
+        versionsBytes = cachedJson.toBytes();
+        log:printInfo("Versions list served from cache", org = org, name = name);
+    } else {
+        string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name);
+        if fetchResult is http:Response {
+            return fetchResult;
+        }
+        if fetchResult is error {
+            log:printError("Failed fetching versions from central", 'error = fetchResult, org = org, name = name);
+            http:Response errResponse = new;
+            errResponse.statusCode = 502;
+            errResponse.setTextPayload("Failed to fetch from central: " + fetchResult.message());
+            return errResponse;
+        }
+        if fetchResult.length() == 0 {
+            http:Response errResponse = new;
+            errResponse.statusCode = 502;
+            errResponse.setTextPayload("No versions available for package");
+            return errResponse;
+        }
+        string versionsJson = fetchResult.toJsonString();
+        versionsBytes = versionsJson.toBytes();
+        _ = check versionsListCache.put(listKey, versionsJson, -1);
+        log:printInfo("Cached versions list", org = org, name = name);
     }
 
-    byte[] versionsBytes = fetchResult.toJsonString().toBytes();
     string digest = computeSha256Digest(versionsBytes);
     _ = check blobCache.put(digest, versionsBytes, -1);
-    _ = check blobSources.put(digest, string `${org}/${name}`, -1);
+    _ = check blobSources.put(digest, listKey, -1);
     log:printInfo("Built latest manifest", org = org, name = name, digest = digest);
     return buildOciManifest(digest, versionsBytes.length());
 }
@@ -229,36 +241,64 @@ isolated function fetchVersionDigestFromCentral(string org, string name, string 
 
 // Builds the OCI manifest for a bala package (GET — uses Central digest, defers bala download to blob request).
 function buildVersionManifestResponse(string org, string name, string version) returns http:Response|error {
-    // Resolve balaURL and store it — bala bytes downloaded only when blob is requested
-    string|http:Response|error balaURLResult = resolveBalaURL(org, name, version);
-    if balaURLResult is http:Response {
-        return balaURLResult;
-    }
-    if balaURLResult is error {
-        log:printError("Failed resolving balaURL", 'error = balaURLResult, org = org, name = name, version = version);
-        http:Response errResponse = new;
-        errResponse.statusCode = 502;
-        errResponse.setTextPayload("Failed to resolve bala URL: " + balaURLResult.message());
-        return errResponse;
+    string metaKey = string `${org}/${name}/${version}`;
+    string digest;
+    string balaURL;
+
+    // Check metadata cache first to avoid redundant Central API calls
+    if versionMetaCache.hasKey(metaKey) {
+        string cached = <string> check versionMetaCache.get(metaKey);
+        int sepIdx = cached.indexOf("|") ?: -1;
+        if sepIdx > 0 {
+            digest = cached.substring(0, sepIdx);
+            balaURL = cached.substring(sepIdx + 1);
+            log:printInfo("Version metadata served from cache", org = org, name = name, version = version, digest = digest);
+        } else {
+            // Malformed cache entry — fall through to re-fetch
+            digest = "";
+            balaURL = "";
+        }
+    } else {
+        digest = "";
+        balaURL = "";
     }
 
-    // Use Central's digest field directly — no bala download needed at manifest time
-    string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
-    if digestResult is http:Response {
-        return digestResult;
-    }
-    if digestResult is error {
-        log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
-        http:Response errResponse = new;
-        errResponse.statusCode = 502;
-        errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
-        return errResponse;
+    if digest == "" || balaURL == "" {
+        // Fetch balaURL and digest from Central
+        string|http:Response|error balaURLResult = resolveBalaURL(org, name, version);
+        if balaURLResult is http:Response {
+            return balaURLResult;
+        }
+        if balaURLResult is error {
+            log:printError("Failed resolving balaURL", 'error = balaURLResult, org = org, name = name, version = version);
+            http:Response errResponse = new;
+            errResponse.statusCode = 502;
+            errResponse.setTextPayload("Failed to resolve bala URL: " + balaURLResult.message());
+            return errResponse;
+        }
+
+        string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
+        if digestResult is http:Response {
+            return digestResult;
+        }
+        if digestResult is error {
+            log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
+            http:Response errResponse = new;
+            errResponse.statusCode = 502;
+            errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
+            return errResponse;
+        }
+
+        digest = digestResult;
+        balaURL = balaURLResult;
+        // Store digest|balaURL in metadata cache
+        _ = check versionMetaCache.put(metaKey, string `${digest}|${balaURL}`, -1);
+        log:printInfo("Cached version metadata", org = org, name = name, version = version, digest = digest);
     }
 
-    // Cache the balaURL so the blob endpoint can download on demand
-    _ = check blobSources.put(digestResult, string `${org}/${name}/${version}`, -1);
-    // Also store the balaURL keyed by a lookup key for the blob handler
-    _ = check blobSources.put(string `url:${digestResult}`, balaURLResult, -1);
-    log:printInfo("Built version manifest", org = org, name = name, version = version, digest = digestResult);
-    return buildOciManifest(digestResult, 0);
+    // Cache the source key and balaURL for the blob endpoint
+    _ = check blobSources.put(digest, metaKey, -1);
+    _ = check blobSources.put(string `url:${digest}`, balaURL, -1);
+    log:printInfo("Built version manifest", org = org, name = name, version = version, digest = digest);
+    return buildOciManifest(digest, 0);
 }

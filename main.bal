@@ -17,6 +17,10 @@ final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e9
 final cache:Cache blobCache = new (capacity = 200, evictionFactor = 0.2, defaultMaxAge = 600, cleanupInterval = 60);
 // Blob source lookup: digest -> "org/name" or "org/name/version", TTL 10 min
 final cache:Cache blobSources = new (capacity = 500, evictionFactor = 0.2, defaultMaxAge = 600, cleanupInterval = 60);
+// Version metadata cache: "org/name/version" -> "digest|balaURL", TTL 30 min
+final cache:Cache versionMetaCache = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
+// Versions list cache: "org/name" -> JSON string of versions array, TTL 5 min
+final cache:Cache versionsListCache = new (capacity = 500, evictionFactor = 0.2, defaultMaxAge = 300, cleanupInterval = 60);
 
 service / on new http:Listener(8080) {
     // GET /v2
