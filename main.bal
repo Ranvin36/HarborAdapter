@@ -49,13 +49,24 @@ service / on new http:Listener(8080) {
     // HEAD /v2/{org}/{name}/manifests/latest
     resource function head v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
         log:printInfo("Received HEAD latest manifest request", org = org, name = name);
-        // For HEAD, build the manifest to get the digest but return headers only
-        http:Response|error manifestResponse = buildLatestManifestResponse(org, name);
-        if manifestResponse is error {
-            return manifestResponse;
+        // Use cached versions JSON to compute digest without a full manifest build
+        string listKey = string `${org}/${name}`;
+        string digest = "";
+        if versionsListCache.hasKey(listKey) {
+            any|cache:Error cacheEntry = versionsListCache.get(listKey);
+            if cacheEntry is string {
+                digest = computeSha256Digest(cacheEntry.toBytes());
+            }
         }
-        string|http:HeaderNotFoundError digestHeader = manifestResponse.getHeader("Docker-Content-Digest");
-        string digest = digestHeader is string ? digestHeader : "";
+        if digest == "" {
+            // Cache miss — do a full build to populate caches and get the digest
+            http:Response|error manifestResponse = buildLatestManifestResponse(org, name);
+            if manifestResponse is error {
+                return manifestResponse;
+            }
+            string|http:HeaderNotFoundError digestHeader = manifestResponse.getHeader("Docker-Content-Digest");
+            digest = digestHeader is string ? digestHeader : "";
+        }
         http:Response headResponse = new;
         headResponse.statusCode = 200;
         headResponse.setHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json");
@@ -65,7 +76,7 @@ service / on new http:Listener(8080) {
     }
 
     // GET /v2/{org}/{name}/manifests/{version}
-    resource function get v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
+    resource function get v2/[string org]/[string name]/manifests/[string version]() returns http:Response|error {
         log:printInfo("Received GET manifest request", org = org, name = name, version = version);
         return buildVersionManifestResponse(org, name, version);
     }
@@ -73,22 +84,38 @@ service / on new http:Listener(8080) {
     // HEAD /v2/{org}/{name}/manifests/{version}
     resource function head v2/[string org]/[string name]/manifests/[string version]() returns http:Response|error {
         log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
-        string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
-        if digestResult is http:Response {
-            return digestResult;
+        // Check metadata cache first to avoid a live Central call
+        string metaKey = string `${org}/${name}/${version}`;
+        string digest = "";
+        if versionMetaCache.hasKey(metaKey) {
+            any|cache:Error metaEntry = versionMetaCache.get(metaKey);
+            if metaEntry is string {
+                int? sepIdxOpt = metaEntry.indexOf("|");
+                int sepIdx = sepIdxOpt is int ? sepIdxOpt : -1;
+                if sepIdx > 0 {
+                    digest = metaEntry.substring(0, sepIdx);
+                }
+            }
         }
-        if digestResult is error {
-            log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
-            http:Response errResponse = new;
-            errResponse.statusCode = 502;
-            errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
-            return errResponse;
+        if digest == "" {
+            string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
+            if digestResult is http:Response {
+                return digestResult;
+            }
+            if digestResult is error {
+                log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
+                http:Response errResponse = new;
+                errResponse.statusCode = 502;
+                errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
+                return errResponse;
+            }
+            digest = digestResult;
         }
         http:Response headResponse = new;
         headResponse.statusCode = 200;
         headResponse.setHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json");
-        headResponse.setHeader("Docker-Content-Digest", digestResult);
-        headResponse.setHeader("ETag", "\"" + digestResult + "\"");
+        headResponse.setHeader("Docker-Content-Digest", digest);
+        headResponse.setHeader("ETag", "\"" + digest + "\"");
         return headResponse;
     }
 

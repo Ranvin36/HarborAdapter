@@ -166,7 +166,31 @@ function buildLatestManifestResponse(string org, string name) returns http:Respo
             versionsBytes = cacheEntry.toBytes();
             log:printInfo("Versions list served from cache", org = org, name = name);
         } else {
+            // Cache entry is wrong type — treat as miss and fall through to fetch
             versionsBytes = [];
+            string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name);
+            if fetchResult is http:Response {
+                return fetchResult;
+            }
+            if fetchResult is error {
+                log:printError("Failed fetching versions from central", 'error = fetchResult, org = org, name = name);
+                http:Response errResponse = new;
+                errResponse.statusCode = 502;
+                errResponse.setTextPayload("Failed to fetch from central: " + fetchResult.message());
+                return errResponse;
+            }
+            if fetchResult.length() == 0 {
+                http:Response errResponse = new;
+                errResponse.statusCode = 502;
+                errResponse.setTextPayload("No versions available for package");
+                return errResponse;
+            }
+            string versionsJson = fetchResult.toJsonString();
+            versionsBytes = versionsJson.toBytes();
+            cache:Error? repairErr = versionsListCache.put(listKey, versionsJson, -1);
+            if repairErr is cache:Error {
+                log:printWarn("Failed to repair versions list cache", org = org, name = name, 'error = repairErr);
+            }
         }
     } else {
         string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name);
