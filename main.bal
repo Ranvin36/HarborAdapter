@@ -116,15 +116,19 @@ service / on new http:Listener(8080) {
 
         // Return from cache if already fetched
         if blobCache.hasKey(digest) {
-            // Clone to avoid sharing mutable byte[] reference across concurrent requests
-            byte[] cachedBlob = (<byte[]> check blobCache.get(digest)).clone();
-            log:printInfo("Serving blob from cache", digest = digest);
-            return buildBlobResponse(cachedBlob, digest, "application/octet-stream");
+            any|cache:Error cacheEntry = blobCache.get(digest);
+            if cacheEntry is byte[] {
+                log:printInfo("Serving blob from cache", digest = digest);
+                return buildBlobResponse(cacheEntry.clone(), digest, "application/octet-stream");
+            }
         }
 
         string? sourceKey = ();
         if blobSources.hasKey(digest) {
-            sourceKey = <string> check blobSources.get(digest);
+            any|cache:Error sourceEntry = blobSources.get(digest);
+            if sourceEntry is string {
+                sourceKey = sourceEntry;
+            }
         }
         log:printInfo("Source key for digest", sourceKey = sourceKey);
         if sourceKey is () {
@@ -176,12 +180,16 @@ service / on new http:Listener(8080) {
             log:printInfo("Serving bala blob", org = decodedOrg, name = decodedName, version = decodedVersion);
 
             // Use cached balaURL if available (set by buildVersionManifestResponse)
-            string balaURL;
+            string balaURL = "";
             string urlKey = string `url:${digest}`;
             if blobSources.hasKey(urlKey) {
-                balaURL = <string> check blobSources.get(urlKey);
-                log:printInfo("Using cached balaURL", digest = digest);
-            } else {
+                any|cache:Error urlEntry = blobSources.get(urlKey);
+                if urlEntry is string {
+                    balaURL = urlEntry;
+                    log:printInfo("Using cached balaURL", digest = digest);
+                }
+            }
+            if balaURL == "" {
                 // Fall back to re-fetching metadata from Central
                 string|http:Response|error balaURLResult = resolveBalaURL(decodedOrg, decodedName, decodedVersion);
                 if balaURLResult is http:Response {

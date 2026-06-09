@@ -161,9 +161,13 @@ function buildLatestManifestResponse(string org, string name) returns http:Respo
     byte[] versionsBytes;
 
     if versionsListCache.hasKey(listKey) {
-        string cachedJson = <string> check versionsListCache.get(listKey);
-        versionsBytes = cachedJson.toBytes();
-        log:printInfo("Versions list served from cache", org = org, name = name);
+        any|cache:Error cacheEntry = versionsListCache.get(listKey);
+        if cacheEntry is string {
+            versionsBytes = cacheEntry.toBytes();
+            log:printInfo("Versions list served from cache", org = org, name = name);
+        } else {
+            versionsBytes = [];
+        }
     } else {
         string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name);
         if fetchResult is http:Response {
@@ -241,8 +245,10 @@ function buildVersionManifestResponse(string org, string name, string version) r
 
     // Check metadata cache first to avoid redundant Central API calls
     if versionMetaCache.hasKey(metaKey) {
-        string cached = <string> check versionMetaCache.get(metaKey);
-        int sepIdx = cached.indexOf("|") ?: -1;
+        any|cache:Error metaEntry = versionMetaCache.get(metaKey);
+        string cached = metaEntry is string ? metaEntry : "";
+        int? sepIdxOpt = cached.indexOf("|");
+        int sepIdx = sepIdxOpt is int ? sepIdxOpt : -1;
         if sepIdx > 0 {
             digest = cached.substring(0, sepIdx);
             balaURL = cached.substring(sepIdx + 1);
