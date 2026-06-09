@@ -116,15 +116,19 @@ service / on new http:Listener(8080) {
 
         // Return from cache if already fetched
         if blobCache.hasKey(digest) {
-            // Clone to avoid sharing mutable byte[] reference across concurrent requests
-            byte[] cachedBlob = (<byte[]> check blobCache.get(digest)).clone();
-            log:printInfo("Serving blob from cache", digest = digest);
-            return buildBlobResponse(cachedBlob, digest, "application/octet-stream");
+            any|cache:Error cacheEntry = blobCache.get(digest);
+            if cacheEntry is byte[] {
+                log:printInfo("Serving blob from cache", digest = digest);
+                return buildBlobResponse(cacheEntry.clone(), digest, "application/octet-stream");
+            }
         }
 
         string? sourceKey = ();
         if blobSources.hasKey(digest) {
-            sourceKey = <string> check blobSources.get(digest);
+            any|cache:Error sourceEntry = blobSources.get(digest);
+            if sourceEntry is string {
+                sourceKey = sourceEntry;
+            }
         }
         log:printInfo("Source key for digest", sourceKey = sourceKey);
         if sourceKey is () {
@@ -157,8 +161,14 @@ service / on new http:Listener(8080) {
 
             byte[] versionsBytes = versionsResult.toJsonString().toBytes();
             string versionsDigest = computeSha256Digest(versionsBytes);
-            _ = check blobCache.put(versionsDigest, versionsBytes, -1);
-            _ = check blobSources.put(versionsDigest, sourceKey, -1);
+            cache:Error? cacheErr = blobCache.put(versionsDigest, versionsBytes, -1);
+            if cacheErr is cache:Error {
+                log:printWarn("Failed to cache versions blob", digest = versionsDigest, 'error = cacheErr);
+            }
+            cacheErr = blobSources.put(versionsDigest, sourceKey, -1);
+            if cacheErr is cache:Error {
+                log:printWarn("Failed to cache versions source", digest = versionsDigest, 'error = cacheErr);
+            }
             log:printInfo("Cached versions blob", digest = versionsDigest, size = versionsBytes.length());
             return buildBlobResponse(versionsBytes, versionsDigest, "application/octet-stream");
 
@@ -170,12 +180,16 @@ service / on new http:Listener(8080) {
             log:printInfo("Serving bala blob", org = decodedOrg, name = decodedName, version = decodedVersion);
 
             // Use cached balaURL if available (set by buildVersionManifestResponse)
-            string balaURL;
+            string balaURL = "";
             string urlKey = string `url:${digest}`;
             if blobSources.hasKey(urlKey) {
-                balaURL = <string> check blobSources.get(urlKey);
-                log:printInfo("Using cached balaURL", digest = digest);
-            } else {
+                any|cache:Error urlEntry = blobSources.get(urlKey);
+                if urlEntry is string {
+                    balaURL = urlEntry;
+                    log:printInfo("Using cached balaURL", digest = digest);
+                }
+            }
+            if balaURL == "" {
                 // Fall back to re-fetching metadata from Central
                 string|http:Response|error balaURLResult = resolveBalaURL(decodedOrg, decodedName, decodedVersion);
                 if balaURLResult is http:Response {
@@ -201,8 +215,14 @@ service / on new http:Listener(8080) {
             }
 
             string balaDigest = computeSha256Digest(balaBytes);
-            _ = check blobCache.put(balaDigest, balaBytes, -1);
-            _ = check blobSources.put(balaDigest, sourceKey, -1);
+            cache:Error? cacheErr = blobCache.put(balaDigest, balaBytes, -1);
+            if cacheErr is cache:Error {
+                log:printWarn("Failed to cache bala blob", digest = balaDigest, 'error = cacheErr);
+            }
+            cacheErr = blobSources.put(balaDigest, sourceKey, -1);
+            if cacheErr is cache:Error {
+                log:printWarn("Failed to cache bala source", digest = balaDigest, 'error = cacheErr);
+            }
             log:printInfo("Cached bala blob", digest = balaDigest, size = balaBytes.length());
             return buildBlobResponse(balaBytes, balaDigest, "application/octet-stream");
 

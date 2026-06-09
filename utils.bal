@@ -1,3 +1,4 @@
+import ballerina/cache;
 import ballerina/http;
 import ballerina/crypto;
 import ballerina/log;
@@ -117,23 +118,6 @@ isolated function downloadBalaBytes(string balaURL) returns byte[]|error {
     return check balaResponse.getBinaryPayload();
 }
 
-// Fetches the bala bytes for a specific package version from Ballerina Central.
-isolated function fetchBalaFromCentral(string org, string name, string version) returns byte[]|http:Response|error {
-    string|http:Response|error balaURLResult = resolveBalaURL(org, name, version);
-    if balaURLResult is http:Response {
-        return balaURLResult;
-    }
-    if balaURLResult is error {
-        return balaURLResult;
-    }
-    byte[]|error balaBytes = downloadBalaBytes(balaURLResult);
-    if balaBytes is error {
-        return balaBytes;
-    }
-    log:printInfo("Fetched bala bytes", org = org, name = name, version = version, size = balaBytes.length());
-    return balaBytes;
-}
-
 // Reads a string field from a JSON object if it exists.
 isolated function getStringField(map<json> data, string fieldName) returns string? {
     json? fieldValue = data[fieldName];
@@ -177,9 +161,13 @@ function buildLatestManifestResponse(string org, string name) returns http:Respo
     byte[] versionsBytes;
 
     if versionsListCache.hasKey(listKey) {
-        string cachedJson = <string> check versionsListCache.get(listKey);
-        versionsBytes = cachedJson.toBytes();
-        log:printInfo("Versions list served from cache", org = org, name = name);
+        any|cache:Error cacheEntry = versionsListCache.get(listKey);
+        if cacheEntry is string {
+            versionsBytes = cacheEntry.toBytes();
+            log:printInfo("Versions list served from cache", org = org, name = name);
+        } else {
+            versionsBytes = [];
+        }
     } else {
         string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name);
         if fetchResult is http:Response {
@@ -200,13 +188,23 @@ function buildLatestManifestResponse(string org, string name) returns http:Respo
         }
         string versionsJson = fetchResult.toJsonString();
         versionsBytes = versionsJson.toBytes();
-        _ = check versionsListCache.put(listKey, versionsJson, -1);
-        log:printInfo("Cached versions list", org = org, name = name);
+        cache:Error? cacheErr = versionsListCache.put(listKey, versionsJson, -1);
+        if cacheErr is cache:Error {
+            log:printWarn("Failed to cache versions list", org = org, name = name, 'error = cacheErr);
+        } else {
+            log:printInfo("Cached versions list", org = org, name = name);
+        }
     }
 
     string digest = computeSha256Digest(versionsBytes);
-    _ = check blobCache.put(digest, versionsBytes, -1);
-    _ = check blobSources.put(digest, listKey, -1);
+    cache:Error? cacheErr = blobCache.put(digest, versionsBytes, -1);
+    if cacheErr is cache:Error {
+        log:printWarn("Failed to cache versions blob", digest = digest, 'error = cacheErr);
+    }
+    cacheErr = blobSources.put(digest, listKey, -1);
+    if cacheErr is cache:Error {
+        log:printWarn("Failed to cache versions source", digest = digest, 'error = cacheErr);
+    }
     log:printInfo("Built latest manifest", org = org, name = name, digest = digest);
     return buildOciManifest(digest, versionsBytes.length());
 }
@@ -247,8 +245,10 @@ function buildVersionManifestResponse(string org, string name, string version) r
 
     // Check metadata cache first to avoid redundant Central API calls
     if versionMetaCache.hasKey(metaKey) {
-        string cached = <string> check versionMetaCache.get(metaKey);
-        int sepIdx = cached.indexOf("|") ?: -1;
+        any|cache:Error metaEntry = versionMetaCache.get(metaKey);
+        string cached = metaEntry is string ? metaEntry : "";
+        int? sepIdxOpt = cached.indexOf("|");
+        int sepIdx = sepIdxOpt is int ? sepIdxOpt : -1;
         if sepIdx > 0 {
             digest = cached.substring(0, sepIdx);
             balaURL = cached.substring(sepIdx + 1);
@@ -292,13 +292,23 @@ function buildVersionManifestResponse(string org, string name, string version) r
         digest = digestResult;
         balaURL = balaURLResult;
         // Store digest|balaURL in metadata cache
-        _ = check versionMetaCache.put(metaKey, string `${digest}|${balaURL}`, -1);
-        log:printInfo("Cached version metadata", org = org, name = name, version = version, digest = digest);
+        cache:Error? cacheErr = versionMetaCache.put(metaKey, string `${digest}|${balaURL}`, -1);
+        if cacheErr is cache:Error {
+            log:printWarn("Failed to cache version metadata", metaKey = metaKey, 'error = cacheErr);
+        } else {
+            log:printInfo("Cached version metadata", org = org, name = name, version = version, digest = digest);
+        }
     }
 
     // Cache the source key and balaURL for the blob endpoint
-    _ = check blobSources.put(digest, metaKey, -1);
-    _ = check blobSources.put(string `url:${digest}`, balaURL, -1);
+    cache:Error? cacheErr = blobSources.put(digest, metaKey, -1);
+    if cacheErr is cache:Error {
+        log:printWarn("Failed to cache blob source", digest = digest, 'error = cacheErr);
+    }
+    cacheErr = blobSources.put(string `url:${digest}`, balaURL, -1);
+    if cacheErr is cache:Error {
+        log:printWarn("Failed to cache balaURL", digest = digest, 'error = cacheErr);
+    }
     log:printInfo("Built version manifest", org = org, name = name, version = version, digest = digest);
     return buildOciManifest(digest, 0);
 }
