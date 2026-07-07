@@ -1,7 +1,0 @@
-[container.image]
-repository="ranvin07" # Docker hub name
-name="harbor-adapter" # container name
-tag="v0.2.0"
-
-[settings]
-buildImage=true 

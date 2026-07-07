@@ -40,16 +40,15 @@ service / on new http:Listener(8080) {
         return v2Response;
     }
 
-    // GET /v2/{org}/{name}/manifests/latest
-    resource function get v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
-        log:printInfo("Received GET latest manifest request", org = org, name = name);
+    // GET /v2/{org}/{name}/{platform}/manifests/latest
+    resource function get v2/[string org]/[string name]/[string platform]/manifests/latest() returns http:Response|error {
+        log:printInfo("Received GET latest manifest request", org = org, name = name, platform = platform);
         return buildLatestManifestResponse(org, name);
     }
 
-    // HEAD /v2/{org}/{name}/manifests/latest
-    resource function head v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
-        log:printInfo("Received HEAD latest manifest request", org = org, name = name);
-        // Use cached versions JSON to compute digest without a full manifest build
+    // HEAD /v2/{org}/{name}/{platform}/manifests/latest
+    resource function head v2/[string org]/[string name]/[string platform]/manifests/latest() returns http:Response|error {
+        log:printInfo("Received HEAD latest manifest request", org = org, name = name, platform = platform);
         string listKey = string `${org}/${name}`;
         string digest = "";
         if versionsListCache.hasKey(listKey) {
@@ -59,7 +58,6 @@ service / on new http:Listener(8080) {
             }
         }
         if digest == "" {
-            // Cache miss — do a full build to populate caches and get the digest
             http:Response|error manifestResponse = buildLatestManifestResponse(org, name);
             if manifestResponse is error {
                 return manifestResponse;
@@ -75,16 +73,22 @@ service / on new http:Listener(8080) {
         return headResponse;
     }
 
-    // GET /v2/{org}/{name}/manifests/{version}
-    resource function get v2/[string org]/[string name]/manifests/[string version]() returns http:Response|error {
-        log:printInfo("Received GET manifest request", org = org, name = name, version = version);
+    // GET /v2/{org}/{name}/{platform}/manifests/{version}
+    resource function get v2/[string org]/[string name]/[string platform]/manifests/[string version](http:Request req) returns http:Response|error {
+        string[] headerNames = req.getHeaderNames();
+        foreach string headerName in headerNames {
+            string|http:HeaderNotFoundError headerValue = req.getHeader(headerName);
+            if headerValue is string {
+                log:printInfo("Request header", name = headerName, value = headerValue);
+            }
+        }
+        log:printInfo("Received GET manifest request", org = org, name = name, platform = platform, version = version);
         return buildVersionManifestResponse(org, name, version);
     }
 
-    // HEAD /v2/{org}/{name}/manifests/{version}
-    resource function head v2/[string org]/[string name]/manifests/[string version]() returns http:Response|error {
-        log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
-        // Check metadata cache first to avoid a live Central call
+    // HEAD /v2/{org}/{name}/{platform}/manifests/{version}
+    resource function head v2/[string org]/[string name]/[string platform]/manifests/[string version]() returns http:Response|error {
+        log:printInfo("Received HEAD manifest request", org = org, name = name, platform = platform, version = version);
         string metaKey = string `${org}/${name}/${version}`;
         string digest = "";
         if versionMetaCache.hasKey(metaKey) {
@@ -119,10 +123,9 @@ service / on new http:Listener(8080) {
         return headResponse;
     }
 
-    // HEAD /v2/{org}/{name}/blobs/{digest}
-    resource function head v2/[string org]/[string name]/blobs/[string digest]() returns http:Response {
-        log:printInfo("Received HEAD request for blob", org = org, name = name, digest = digest);
-        // All digests we issue are valid — always acknowledge existence
+    // HEAD /v2/{org}/{name}/{platform}/blobs/{digest}
+    resource function head v2/[string org]/[string name]/[string platform]/blobs/[string digest]() returns http:Response {
+        log:printInfo("Received HEAD request for blob", org = org, name = name, platform = platform, digest = digest);
         http:Response headResponse = new;
         headResponse.statusCode = 200;
         headResponse.setHeader("Content-Type", "application/octet-stream");
@@ -130,9 +133,9 @@ service / on new http:Listener(8080) {
         return headResponse;
     }
 
-    // GET /v2/{org}/{name}/blobs/{digest}
-    resource function get v2/[string org]/[string name]/blobs/[string digest]() returns http:Response|error {
-        log:printInfo("Received request for blob", org = org, name = name, digest = digest);
+    // GET /v2/{org}/{name}/{platform}/blobs/{digest}
+    resource function get v2/[string org]/[string name]/[string platform]/blobs/[string digest]() returns http:Response|error {
+        log:printInfo("Received request for blob", org = org, name = name, platform = platform, digest = digest);
 
         if digest == OCI_EMPTY_CONFIG_DIGEST {
             http:Response configResponse = new;
@@ -187,17 +190,13 @@ service / on new http:Listener(8080) {
             }
 
             byte[] versionsBytes = versionsResult.toJsonString().toBytes();
-            string versionsDigest = computeSha256Digest(versionsBytes);
-            cache:Error? cacheErr = blobCache.put(versionsDigest, versionsBytes, -1);
+            // Use the digest Harbor requested — it was advertised in the manifest
+            cache:Error? cacheErr = blobCache.put(digest, versionsBytes, -1);
             if cacheErr is cache:Error {
-                log:printWarn("Failed to cache versions blob", digest = versionsDigest, 'error = cacheErr);
+                log:printWarn("Failed to cache versions blob", digest = digest, 'error = cacheErr);
             }
-            cacheErr = blobSources.put(versionsDigest, sourceKey, -1);
-            if cacheErr is cache:Error {
-                log:printWarn("Failed to cache versions source", digest = versionsDigest, 'error = cacheErr);
-            }
-            log:printInfo("Cached versions blob", digest = versionsDigest, size = versionsBytes.length());
-            return buildBlobResponse(versionsBytes, versionsDigest, "application/octet-stream");
+            log:printInfo("Serving versions blob", digest = digest, size = versionsBytes.length());
+            return buildBlobResponse(versionsBytes, digest, "application/octet-stream");
 
         } else if parts.length() == 3 {
             // "org/name/version" — serve bala bytes
@@ -241,17 +240,13 @@ service / on new http:Listener(8080) {
                 return errResponse;
             }
 
-            string balaDigest = computeSha256Digest(balaBytes);
-            cache:Error? cacheErr = blobCache.put(balaDigest, balaBytes, -1);
+            // Use the digest Harbor requested — it was advertised in the manifest
+            cache:Error? cacheErr = blobCache.put(digest, balaBytes, -1);
             if cacheErr is cache:Error {
-                log:printWarn("Failed to cache bala blob", digest = balaDigest, 'error = cacheErr);
+                log:printWarn("Failed to cache bala blob", digest = digest, 'error = cacheErr);
             }
-            cacheErr = blobSources.put(balaDigest, sourceKey, -1);
-            if cacheErr is cache:Error {
-                log:printWarn("Failed to cache bala source", digest = balaDigest, 'error = cacheErr);
-            }
-            log:printInfo("Cached bala blob", digest = balaDigest, size = balaBytes.length());
-            return buildBlobResponse(balaBytes, balaDigest, "application/octet-stream");
+            log:printInfo("Serving bala blob", digest = digest, size = balaBytes.length());
+            return buildBlobResponse(balaBytes, digest, "application/octet-stream");
 
         } else {
             log:printError("Unexpected blob source format", sourceKey = sourceKey);
