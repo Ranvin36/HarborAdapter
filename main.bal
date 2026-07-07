@@ -40,15 +40,16 @@ service / on new http:Listener(8080) {
         return v2Response;
     }
 
-    // GET /v2/{org}/{name}/{platform}/manifests/latest
-    resource function get v2/[string org]/[string name]/[string platform]/manifests/latest() returns http:Response|error {
-        log:printInfo("Received GET latest manifest request", org = org, name = name, platform = platform);
+    // GET /v2/{org}/{name}/manifests/latest
+    resource function get v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
+        log:printInfo("Received GET latest manifest request", org = org, name = name);
         return buildLatestManifestResponse(org, name);
     }
 
-    // HEAD /v2/{org}/{name}/{platform}/manifests/latest
-    resource function head v2/[string org]/[string name]/[string platform]/manifests/latest() returns http:Response|error {
-        log:printInfo("Received HEAD latest manifest request", org = org, name = name, platform = platform);
+    // HEAD /v2/{org}/{name}/manifests/latest
+    resource function head v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
+        log:printInfo("Received HEAD latest manifest request", org = org, name = name);
+        // Use cached versions JSON to compute digest without a full manifest build
         string listKey = string `${org}/${name}`;
         string digest = "";
         if versionsListCache.hasKey(listKey) {
@@ -58,6 +59,7 @@ service / on new http:Listener(8080) {
             }
         }
         if digest == "" {
+            // Cache miss — do a full build to populate caches and get the digest
             http:Response|error manifestResponse = buildLatestManifestResponse(org, name);
             if manifestResponse is error {
                 return manifestResponse;
@@ -73,8 +75,24 @@ service / on new http:Listener(8080) {
         return headResponse;
     }
 
-    // GET /v2/{org}/{name}/{platform}/manifests/{version}
-    resource function get v2/[string org]/[string name]/[string platform]/manifests/[string version](http:Request req) returns http:Response|error {
+    // GET /v2/{org}/{name}/{platform}/manifests/{version} — test endpoint
+    resource function get v2/[string org]/[string name]/[string platform]/manifests/[string version]() returns http:Response {
+        log:printInfo("Received 3-segment manifest request", org = org, name = name, platform = platform, version = version);
+        http:Response testResponse = new;
+        testResponse.statusCode = 200;
+        testResponse.setTextPayload("ok");
+        return testResponse;
+    }
+    resource function head v2/[string org]/[string name]/[string platform]/manifests/[string version]() returns http:Response {
+        log:printInfo("Received 3-segment manifest request", org = org, name = name, platform = platform, version = version);
+        http:Response testResponse = new;
+        testResponse.statusCode = 200;
+        testResponse.setTextPayload("ok");
+        return testResponse;
+    }
+
+    // GET /v2/{org}/{name}/manifests/{version}
+    resource function get v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
         string[] headerNames = req.getHeaderNames();
         foreach string headerName in headerNames {
             string|http:HeaderNotFoundError headerValue = req.getHeader(headerName);
@@ -82,13 +100,14 @@ service / on new http:Listener(8080) {
                 log:printInfo("Request header", name = headerName, value = headerValue);
             }
         }
-        log:printInfo("Received GET manifest request", org = org, name = name, platform = platform, version = version);
+        log:printInfo("Received GET manifest request", org = org, name = name, version = version);
         return buildVersionManifestResponse(org, name, version);
     }
 
-    // HEAD /v2/{org}/{name}/{platform}/manifests/{version}
-    resource function head v2/[string org]/[string name]/[string platform]/manifests/[string version]() returns http:Response|error {
-        log:printInfo("Received HEAD manifest request", org = org, name = name, platform = platform, version = version);
+    // HEAD /v2/{org}/{name}/manifests/{version}
+    resource function head v2/[string org]/[string name]/manifests/[string version]() returns http:Response|error {
+        log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
+        // Check metadata cache first to avoid a live Central call
         string metaKey = string `${org}/${name}/${version}`;
         string digest = "";
         if versionMetaCache.hasKey(metaKey) {
@@ -123,9 +142,10 @@ service / on new http:Listener(8080) {
         return headResponse;
     }
 
-    // HEAD /v2/{org}/{name}/{platform}/blobs/{digest}
-    resource function head v2/[string org]/[string name]/[string platform]/blobs/[string digest]() returns http:Response {
-        log:printInfo("Received HEAD request for blob", org = org, name = name, platform = platform, digest = digest);
+    // HEAD /v2/{org}/{name}/blobs/{digest}
+    resource function head v2/[string org]/[string name]/blobs/[string digest]() returns http:Response {
+        log:printInfo("Received HEAD request for blob", org = org, name = name, digest = digest);
+        // All digests we issue are valid — always acknowledge existence
         http:Response headResponse = new;
         headResponse.statusCode = 200;
         headResponse.setHeader("Content-Type", "application/octet-stream");
@@ -133,9 +153,9 @@ service / on new http:Listener(8080) {
         return headResponse;
     }
 
-    // GET /v2/{org}/{name}/{platform}/blobs/{digest}
-    resource function get v2/[string org]/[string name]/[string platform]/blobs/[string digest]() returns http:Response|error {
-        log:printInfo("Received request for blob", org = org, name = name, platform = platform, digest = digest);
+    // GET /v2/{org}/{name}/blobs/{digest}
+    resource function get v2/[string org]/[string name]/blobs/[string digest]() returns http:Response|error {
+        log:printInfo("Received request for blob", org = org, name = name, digest = digest);
 
         if digest == OCI_EMPTY_CONFIG_DIGEST {
             http:Response configResponse = new;
