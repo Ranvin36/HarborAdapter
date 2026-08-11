@@ -127,9 +127,11 @@ isolated function getStringField(map<json> data, string fieldName) returns strin
     return ();
 }
 
-// Builds and returns the OCI manifest HTTP response.
-isolated function buildOciManifest(string digest, int layerSize) returns http:Response {
-    string ociManifest = string `{
+// Builds the JSON text of an OCI manifest whose single layer points at the given digest.
+// Pulled out of buildOciManifest so callers that only need the bytes (e.g. to measure a
+// subject manifest's size for a referrers-index entry) don't have to unpack an http:Response.
+isolated function buildOciManifestText(string digest, int layerSize) returns string {
+    return string `{
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
         "config": {
@@ -145,6 +147,11 @@ isolated function buildOciManifest(string digest, int layerSize) returns http:Re
             }
         ]
     }`;
+}
+
+// Builds and returns the OCI manifest HTTP response.
+isolated function buildOciManifest(string digest, int layerSize) returns http:Response {
+    string ociManifest = buildOciManifestText(digest, layerSize);
 
     http:Response manifestResponse = new;
     manifestResponse.statusCode = 200;

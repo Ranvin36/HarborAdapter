@@ -21,6 +21,10 @@ final cache:Cache blobSources = new (capacity = 500, evictionFactor = 0.2, defau
 final cache:Cache versionMetaCache = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
 // Versions list cache: "org/name" -> JSON string of versions array, TTL 5 min
 final cache:Cache versionsListCache = new (capacity = 500, evictionFactor = 0.2, defaultMaxAge = 300, cleanupInterval = 60);
+// Dependency graph referrer metadata: "org/name/version" -> "manifestDigest|manifestSize", TTL 30 min
+final cache:Cache depGraphMetaCache = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
+// Referrer manifest bytes: referrer manifest digest -> manifest JSON text, TTL 30 min
+final cache:Cache referrerManifestCache = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
 
 service / on new http:Listener(8080) {
     // GET /v2
