@@ -21,10 +21,16 @@ final cache:Cache blobSources = new (capacity = 500, evictionFactor = 0.2, defau
 final cache:Cache versionMetaCache = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
 // Versions list cache: "org/name" -> JSON string of versions array, TTL 5 min
 final cache:Cache versionsListCache = new (capacity = 500, evictionFactor = 0.2, defaultMaxAge = 300, cleanupInterval = 60);
-// Dependency graph referrer metadata: "org/name/version" -> "manifestDigest|manifestSize", TTL 30 min
+// Dependency graph referrer metadata: subject (version manifest) digest -> ReferrerInfo, TTL 30 min.
+// A cache hit here means Central's resolve-dependencies call is skipped entirely.
 final cache:Cache depGraphMetaCache = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
 // Referrer manifest bytes: referrer manifest digest -> manifest JSON text, TTL 30 min
 final cache:Cache referrerManifestCache = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
+// Version manifest self-digest -> SubjectManifestInfo{org/name/version, manifest size}. Populated
+// whenever a version manifest is built, since a referrers query only ever carries that digest and
+// there is no other way to recover which package it belongs to. Same TTL as versionMetaCache so
+// the two rise and fall together (see the HEAD-manifest/blobSources TTL note on that cache).
+final cache:Cache subjectManifestSources = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
 
 service / on new http:Listener(8080) {
     // GET /v2
@@ -104,6 +110,16 @@ service / on new http:Listener(8080) {
                 log:printInfo("Request header", name = headerName, value = headerValue);
             }
         }
+        // A referrer manifest (e.g. the dependency-graph artifact) is requested by its own
+        // digest, not a version tag — serve it straight from cache if that's what this is.
+        if referrerManifestCache.hasKey(version) {
+            any|cache:Error cachedManifest = referrerManifestCache.get(version);
+            if cachedManifest is string {
+                log:printInfo("Serving cached referrer manifest", digest = version);
+                return buildCachedManifestResponse(version, cachedManifest);
+            }
+        }
+
         log:printInfo("Received GET manifest request", org = org, name = name, version = version);
         return buildVersionManifestResponse(org, name, version);
     }
@@ -111,6 +127,14 @@ service / on new http:Listener(8080) {
     // HEAD /v2/{org}/{name}/manifests/{version}
     resource function head v2/[string org]/[string name]/manifests/[string version]() returns http:Response|error {
         log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
+
+        if referrerManifestCache.hasKey(version) {
+            any|cache:Error cachedManifest = referrerManifestCache.get(version);
+            if cachedManifest is string {
+                return buildCachedManifestResponse(version, cachedManifest);
+            }
+        }
+
         // Check metadata cache first to avoid a live Central call
         string metaKey = string `${org}/${name}/${version}`;
         string digest = "";
@@ -144,6 +168,47 @@ service / on new http:Listener(8080) {
         headResponse.setHeader("Docker-Content-Digest", digest);
         headResponse.setHeader("ETag", "\"" + digest + "\"");
         return headResponse;
+    }
+
+    // GET /v2/{org}/{name}/referrers/{digest} — OCI Distribution Spec referrers API.
+    // `digest` is a version manifest's own (self) digest, discovered by the caller from a prior
+    // manifest GET/HEAD. Currently the only referrer type this adapter publishes is the
+    // dependency graph, fetched from Central's resolve-dependencies endpoint (never the bala).
+    resource function get v2/[string org]/[string name]/referrers/[string digest](http:Request req)
+            returns http:Response|error {
+        log:printInfo("Received GET referrers request", org = org, name = name, digest = digest);
+        string? artifactTypeFilter = req.getQueryParamValue("artifactType");
+
+        if !subjectManifestSources.hasKey(digest) {
+            // Unknown subject digest — an empty index is the spec-correct response, not a 404.
+            return buildReferrersIndexResponse([]);
+        }
+        any|cache:Error subjectEntry = subjectManifestSources.get(digest);
+        if !(subjectEntry is SubjectManifestInfo) {
+            return buildReferrersIndexResponse([]);
+        }
+
+        if artifactTypeFilter is string && artifactTypeFilter != DEP_GRAPH_ARTIFACT_TYPE {
+            return buildReferrersIndexResponse([]);
+        }
+
+        string[] parts = re `/`.split(subjectEntry.metaKey);
+        if parts.length() != 3 {
+            log:printWarn("Malformed subject source key", metaKey = subjectEntry.metaKey);
+            return buildReferrersIndexResponse([]);
+        }
+
+        ReferrerInfo|http:Response|error referrerResult = buildDependencyGraphReferrer(
+                parts[0], parts[1], parts[2], digest, subjectEntry.size);
+        if referrerResult is http:Response {
+            return referrerResult;
+        }
+        if referrerResult is error {
+            log:printWarn("Failed to build dependency graph referrer", 'error = referrerResult,
+                    org = parts[0], name = parts[1], version = parts[2]);
+            return buildReferrersIndexResponse([]);
+        }
+        return buildReferrersIndexResponse([referrerResult]);
     }
 
     // HEAD /v2/{org}/{name}/blobs/{digest}
@@ -241,18 +306,19 @@ service / on new http:Listener(8080) {
             }
             if balaURL == "" {
                 // Fall back to re-fetching metadata from Central
-                string|http:Response|error balaURLResult = resolveBalaURL(decodedOrg, decodedName, decodedVersion);
-                if balaURLResult is http:Response {
-                    return balaURLResult;
+                VersionMetadata|http:Response|error metadataResult =
+                        resolveBalaURL(decodedOrg, decodedName, decodedVersion);
+                if metadataResult is http:Response {
+                    return metadataResult;
                 }
-                if balaURLResult is error {
-                    log:printError("Failed resolving balaURL", 'error = balaURLResult);
+                if metadataResult is error {
+                    log:printError("Failed resolving balaURL", 'error = metadataResult);
                     http:Response errResponse = new;
                     errResponse.statusCode = 502;
-                    errResponse.setTextPayload("Failed to resolve bala URL: " + balaURLResult.message());
+                    errResponse.setTextPayload("Failed to resolve bala URL: " + metadataResult.message());
                     return errResponse;
                 }
-                balaURL = balaURLResult;
+                balaURL = metadataResult.balaURL;
             }
 
             byte[]|error balaBytes = downloadBalaBytes(balaURL);
