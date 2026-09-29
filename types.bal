@@ -1,36 +1,52 @@
+// Sizing and expiry for one in-memory cache; times are in seconds.
+type CacheSettings record {|
+    int capacity;
+    decimal maxAge;
+    decimal cleanupInterval;
+    float evictionFactor = 0.2;
+|};
+
 type VersionsResponse record {|
     string[] versions;
 |};
 
-// Version metadata resolved from Ballerina Central for one package version: the bala download
-// URL, the platform/distribution it was published for, and its current deprecation status — used
-// to annotate the OCI manifest so a Ballerina client can filter compatible versions and surface
-// deprecation warnings without downloading the bala.
+// Metadata for one package version resolved from Central.
 type VersionMetadata record {|
     string balaURL;
+    string digest; // OCI format: "sha256:<hex>"
     string platform;
     string distributionVersion;
     boolean isDeprecated;
     string deprecateMessage;
+    string[] modules; // empty if Central does not report them
 |};
 
-// Identifies a built dependency-graph referrer artifact: its own manifest digest and byte size,
-// as needed for a referrers-index entry (OCI Distribution Spec `GET /v2/{name}/referrers/{digest}`).
+// Source of a version-index blob; distribution is "" for the unscoped `latest` index.
+type IndexSource record {|
+    string org;
+    string name;
+    string distribution;
+|};
+
+// Built version manifest cached per "org/name/version".
+type VersionManifest record {|
+    string manifestText;
+    string manifestDigest; // sha256 of manifestText
+    string layerDigest;    // digest of the bala layer
+    int layerSize;         // byte size of the bala layer
+|};
+
 type ReferrerInfo record {|
     string manifestDigest;
     int manifestSize;
 |};
 
-// Maps a version manifest's own (self) digest back to the package it identifies, plus that
-// manifest's byte size — both are needed to answer `GET /v2/{name}/referrers/{digest}` and to
-// populate the `subject` descriptor of a referrer manifest, since that query only carries a digest.
+// Maps a version manifest digest back to its package key and byte size for referrers lookups.
 type SubjectManifestInfo record {|
     string metaKey;
     int size;
 |};
 
-// Central's `POST /registry/packages/resolve-dependencies` request/response shapes
-// (mirrors org.ballerinalang.central.client.model.PackageResolutionRequest/Response).
 type ResolutionPackageRequest record {|
     string org;
     string name;

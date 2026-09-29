@@ -2,11 +2,14 @@ import ballerina/cache;
 import ballerina/http;
 import ballerina/crypto;
 import ballerina/log;
+import ballerina/lang.regexp;
 import ballerina/url;
 
 final string DEP_GRAPH_ARTIFACT_TYPE = "application/vnd.ballerina.dependency-graph.v1+json";
 
-// Converts a byte array to a lowercase hex string.
+// All JvmTarget codes (io.ballerina.projects.JvmTarget); keep in sync.
+final string ALL_JVM_PLATFORMS = "java25,java21,java17,java11";
+
 isolated function bytesToHex(byte[] input) returns string {
     string hexChars = "0123456789abcdef";
     string hexEncoded = "";
@@ -19,13 +22,18 @@ isolated function bytesToHex(byte[] input) returns string {
     return hexEncoded;
 }
 
-// Computes a content-addressable OCI digest for a blob.
 isolated function computeSha256Digest(byte[] content) returns string {
     byte[] digestBytes = crypto:hashSha256(content);
     return "sha256:" + bytesToHex(digestBytes);
 }
 
-// Builds a blob response with OCI-friendly headers.
+isolated function cachePut(cache:Cache targetCache, string key, any value, string description) {
+    cache:Error? cacheErr = targetCache.put(key, value, -1);
+    if cacheErr is cache:Error {
+        log:printWarn("Failed to cache " + description, key = key, 'error = cacheErr);
+    }
+}
+
 isolated function buildBlobResponse(byte[] content, string digest, string contentType) returns http:Response {
     http:Response blobResponse = new;
     blobResponse.statusCode = 200;
@@ -37,28 +45,79 @@ isolated function buildBlobResponse(byte[] content, string digest, string conten
     return blobResponse;
 }
 
-// Fetches the list of versions for a package from Ballerina Central.
-isolated function fetchVersionsFromCentral(string org, string name) returns string[]|http:Response|error {
+isolated function buildRegistryErrorResponse(int statusCode, string code, string message) returns http:Response {
+    http:Response errResponse = new;
+    errResponse.statusCode = statusCode;
+    errResponse.setJsonPayload({"errors": [{"code": code, "message": message}]});
+    return errResponse;
+}
+
+// Generic 502 for upstream failures; details go to the logs, not to the client.
+isolated function buildUpstreamErrorResponse() returns http:Response {
+    return buildRegistryErrorResponse(502, "UNKNOWN", "upstream registry unavailable");
+}
+
+// Caps untrusted/unbounded text (e.g. upstream response bodies) before logging it.
+isolated function truncateForLog(string value, int maxLength = 512) returns string {
+    return value.length() <= maxLength ? value : value.substring(0, maxLength) + "...(truncated)";
+}
+
+// "v2201-13-0" -> "2201.13.0"; returns () for non-index tags (e.g. "1.2.3").
+isolated function indexTagToDistribution(string reference) returns string? {
+    regexp:Groups? groups = re `v(\d+)-(\d+)-(\d+)`.fullMatchGroups(reference);
+    if groups is () {
+        return ();
+    }
+    regexp:Span? major = groups[1];
+    regexp:Span? minor = groups[2];
+    regexp:Span? patch = groups[3];
+    if major is () || minor is () || patch is () {
+        return ();
+    }
+    return string `${major.substring()}.${minor.substring()}.${patch.substring()}`;
+}
+
+// Path params arrive URL-decoded, so re-encode before building Central URLs; otherwise a request
+// like `foo%2F..%2Fbar` would reach other Central endpoints. url:encode is form encoding
+// (space -> "+"), so "+" is switched to "%20" to be correct in a path segment.
+isolated function encodePathSegment(string value) returns string|error {
+    string encoded = check url:encode(value, "UTF-8");
+    return re `\+`.replaceAll(encoded, "%20");
+}
+
+// When distribution is given, sends User-Agent + Ballerina-Platform so Central filters by it.
+isolated function fetchVersionsFromCentral(string org, string name, string distribution = "")
+        returns string[]|http:Response|error {
+    map<string> headers = {};
+    if distribution != "" {
+        headers["User-Agent"] = distribution;
+        headers["Ballerina-Platform"] = ALL_JVM_PLATFORMS;
+    }
+    string encodedOrg = check encodePathSegment(org);
+    string encodedName = check encodePathSegment(name);
     http:Response centralResponse = check centralClient->get(
-        string `/2.0/registry/packages/${org}/${name}`
+        string `/2.0/registry/packages/${encodedOrg}/${encodedName}`, headers
     );
 
     if centralResponse.statusCode == 404 {
-        log:printInfo("Package not found in central", org = org, name = name);
+        log:printDebug("Package not found in central", org = org, name = name);
         http:Response notFound = new;
         notFound.statusCode = 404;
         notFound.setTextPayload(string `Package '${org}/${name}' does not exist`, contentType = "text/plain");
         return notFound;
     }
+    if centralResponse.statusCode != 200 {
+        return error(string `central returned HTTP ${centralResponse.statusCode} for ${org}/${name}`);
+    }
 
     json responsePayload = check centralResponse.getJsonPayload();
-    log:printInfo("Fetched versions from central", org = org, name = name, response = responsePayload);
+    log:printDebug("Fetched versions from central", org = org, name = name);
 
-    // Central returns a JSON object with a `message` field when the package is not found.
+    // Central returns a JSON object with a `message` field for unknown packages.
     if responsePayload is map<json> {
         json messageField = responsePayload["message"];
         if messageField is string {
-            log:printInfo("Package not found in central (message response)", org = org, name = name, centralMessage = messageField);
+            log:printDebug("Package not found in central (message response)", org = org, name = name, centralMessage = messageField);
             http:Response notFound = new;
             notFound.statusCode = 404;
             notFound.setTextPayload(string `Package '${org}/${name}' does not exist`, contentType = "text/plain");
@@ -72,25 +131,28 @@ isolated function fetchVersionsFromCentral(string org, string name) returns stri
     return versionList;
 }
 
-// Resolves version metadata (bala URL, platform, distribution) for a specific package version
-// from Ballerina Central. Platform/distribution default to "" rather than failing the whole
-// lookup if Central's response happens not to carry them — they only drive manifest annotations,
-// balaURL is the one field the caller cannot proceed without.
-isolated function resolveBalaURL(string org, string name, string version) returns VersionMetadata|http:Response|error {
+isolated function resolveVersionMetadata(string org, string name, string version)
+        returns VersionMetadata|http:Response|error {
+    string encodedOrg = check encodePathSegment(org);
+    string encodedName = check encodePathSegment(name);
+    string encodedVersion = check encodePathSegment(version);
     http:Response versionMetadataResponse = check centralClient->get(
-        string `/2.0/registry/packages/${org}/${name}/${version}`
+        string `/2.0/registry/packages/${encodedOrg}/${encodedName}/${encodedVersion}`
     );
 
     if versionMetadataResponse.statusCode == 404 {
-        log:printInfo("Package not found in central", org = org, name = name, version = version);
+        log:printDebug("Package not found in central", org = org, name = name, version = version);
         http:Response notFound = new;
         notFound.statusCode = 404;
         notFound.setTextPayload(string `Package '${org}/${name}:${version}' does not exist`, contentType = "text/plain");
         return notFound;
     }
+    if versionMetadataResponse.statusCode != 200 {
+        return error(string `central returned HTTP ${versionMetadataResponse.statusCode} for ${org}/${name}:${version}`);
+    }
 
     json responsePayload = check versionMetadataResponse.getJsonPayload();
-    log:printInfo("Fetched metadata from central", org = org, name = name, version = version);
+    log:printDebug("Fetched metadata from central", org = org, name = name, version = version);
 
     map<json> versionData = check responsePayload.cloneWithType();
     string? balaURL = getStringField(versionData, "balaURL");
@@ -104,32 +166,57 @@ isolated function resolveBalaURL(string org, string name, string version) return
         return error("Central version metadata did not contain a balaURL, balURL, or URL field");
     }
 
+    string? rawDigest = getStringField(versionData, "digest");
+    if rawDigest is () {
+        return error("Central version metadata did not contain a digest field");
+    }
+    string digest = re `sha-256=`.replaceAll(rawDigest, "sha256:"); // Central: "sha-256=<hex>" -> OCI: "sha256:<hex>"
+
     string platform = getStringField(versionData, "platform") ?: "";
     string distributionVersion = getStringField(versionData, "ballerinaVersion") ?: "";
     boolean isDeprecated = getBooleanField(versionData, "isDeprecated") ?: false;
     string deprecateMessage = getStringField(versionData, "deprecateMessage") ?: "";
-    return {balaURL, platform, distributionVersion, isDeprecated, deprecateMessage};
+    string[] modules = getModuleNames(versionData);
+    return {balaURL, digest, platform, distributionVersion, isDeprecated, deprecateMessage, modules};
 }
 
-// Downloads bala bytes from a presigned CDN URL.
-isolated function downloadBalaBytes(string balaURL) returns byte[]|error {
-    // Split into base (scheme + host) and path+query — preserves presigned query params
-    int? pathStart = balaURL.indexOf("/", 8); // skip "https://"
-    string balaBase;
-    string balaPath;
-    if pathStart is int {
-        balaBase = balaURL.substring(0, pathStart);
-        balaPath = balaURL.substring(pathStart);
-    } else {
-        balaBase = balaURL;
-        balaPath = "/";
+isolated function getModuleNames(map<json> versionData) returns string[] {
+    json modulesField = versionData["modules"];
+    if modulesField !is json[] {
+        return [];
     }
-    http:Client balaClient = check new (balaBase, {timeout: 50});
-    http:Response balaResponse = check balaClient->get(balaPath);
-    return check balaResponse.getBinaryPayload();
+    string[] names = [];
+    foreach json module in modulesField {
+        if module is map<json> {
+            string? name = getStringField(module, "name");
+            if name is string {
+                names.push(name);
+            }
+        }
+    }
+    return names;
 }
 
-// Reads a string field from a JSON object if it exists.
+isolated function splitBalaURL(string balaURL) returns [string, string] {
+    int? pathStart = balaURL.indexOf("/", 8); // skip "https://"
+    if pathStart is int {
+        return [balaURL.substring(0, pathStart), balaURL.substring(pathStart)];
+    }
+    return [balaURL, "/"];
+}
+
+// HEAD the CDN URL to get the bala size without downloading it.
+isolated function fetchBalaSize(string balaURL) returns int|error {
+    [string, string] [balaBase, balaPath] = splitBalaURL(balaURL);
+    http:Client balaClient = check new (balaBase, {timeout: balaCdnTimeout});
+    http:Response balaResponse = check balaClient->head(balaPath);
+    if balaResponse.statusCode != 200 {
+        return error(string `bala HEAD returned HTTP ${balaResponse.statusCode}`);
+    }
+    string contentLength = check balaResponse.getHeader("Content-Length");
+    return int:fromString(contentLength);
+}
+
 isolated function getStringField(map<json> data, string fieldName) returns string? {
     json? fieldValue = data[fieldName];
     if fieldValue is string {
@@ -138,7 +225,6 @@ isolated function getStringField(map<json> data, string fieldName) returns strin
     return ();
 }
 
-// Reads a boolean field from a JSON object if it exists.
 isolated function getBooleanField(map<json> data, string fieldName) returns boolean? {
     json? fieldValue = data[fieldName];
     if fieldValue is boolean {
@@ -147,9 +233,7 @@ isolated function getBooleanField(map<json> data, string fieldName) returns bool
     return ();
 }
 
-// Escapes a string for embedding as a JSON string value inside a hand-built template. Needed for
-// the deprecation message specifically, since (unlike platform/distribution, which are
-// toolchain-controlled values) it is free text a package owner wrote on Central.
+// Escapes free-text values (e.g. deprecation messages) for embedding in hand-built JSON.
 isolated function jsonEscape(string value) returns string {
     string escaped = re `\\`.replaceAll(value, "\\\\");
     escaped = re `"`.replaceAll(escaped, "\\\"");
@@ -159,23 +243,21 @@ isolated function jsonEscape(string value) returns string {
     return escaped;
 }
 
-// Builds the JSON text of an OCI manifest whose single layer points at the given digest.
-// Pulled out of buildOciManifest so callers that only need the bytes (e.g. to measure a
-// subject manifest's size for a referrers-index entry) don't have to unpack an http:Response.
-//
-// platform/distributionVersion are optional: the "latest" version-list manifest has no single
-// platform/distribution to report, so it's built with both left as "" and no annotations appear.
+// Omit platform/distributionVersion for index manifests (no annotations needed).
 isolated function buildOciManifestText(string digest, int layerSize, string platform = "",
-        string distributionVersion = "", boolean isDeprecated = false, string deprecateMessage = "")
-        returns string {
+        string distributionVersion = "", boolean isDeprecated = false, string deprecateMessage = "",
+        string[] modules = []) returns string {
     string annotations = "";
     if platform != "" {
+        // Module names have no commas, so a CSV list is safe.
+        string moduleAnnotation = modules.length() == 0 ? "" : string `,
+            "io.ballerina.modules": "${jsonEscape(",".'join(...modules))}"`;
         annotations = string `,
         "annotations": {
             "io.ballerina.platform": "${platform}",
             "io.ballerina.distribution": "${distributionVersion}",
             "io.ballerina.deprecated": "${isDeprecated.toString()}",
-            "io.ballerina.deprecation-message": "${jsonEscape(deprecateMessage)}"
+            "io.ballerina.deprecation-message": "${jsonEscape(deprecateMessage)}"${moduleAnnotation}
         }`;
     }
     return string `{
@@ -196,25 +278,34 @@ isolated function buildOciManifestText(string digest, int layerSize, string plat
     }`;
 }
 
-// Builds and returns the OCI manifest HTTP response.
-isolated function buildOciManifest(string digest, int layerSize, string platform = "",
-        string distributionVersion = "", boolean isDeprecated = false, string deprecateMessage = "")
-        returns http:Response {
-    string ociManifest = buildOciManifestText(digest, layerSize, platform, distributionVersion, isDeprecated,
-            deprecateMessage);
-
+isolated function buildManifestResponse(string digest, string manifestText) returns http:Response {
     http:Response manifestResponse = new;
     manifestResponse.statusCode = 200;
     manifestResponse.setHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json");
     manifestResponse.setHeader("Docker-Content-Digest", digest);
     manifestResponse.setHeader("ETag", "\"" + digest + "\"");
-    manifestResponse.setTextPayload(ociManifest, contentType = "application/vnd.oci.image.manifest.v1+json");
+    manifestResponse.setTextPayload(manifestText, contentType = "application/vnd.oci.image.manifest.v1+json");
     return manifestResponse;
 }
 
-// Builds the OCI manifest for the package versions.
-function buildLatestManifestResponse(string org, string name) returns http:Response|error {
-    string listKey = string `${org}/${name}`;
+isolated function toHeadResponse(http:Response getResponse) returns http:Response|error {
+    if getResponse.statusCode != 200 {
+        return getResponse;
+    }
+    string digest = check getResponse.getHeader("Docker-Content-Digest");
+    byte[] body = check getResponse.getBinaryPayload();
+    http:Response headResponse = new;
+    headResponse.statusCode = 200;
+    headResponse.setHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json");
+    headResponse.setHeader("Docker-Content-Digest", digest);
+    headResponse.setHeader("ETag", "\"" + digest + "\"");
+    headResponse.setHeader("Content-Length", body.length().toString());
+    return headResponse;
+}
+
+function buildIndexManifestResponse(string org, string name, string distribution = "")
+        returns http:Response|error {
+    string listKey = string `${org}/${name}@${distribution}`;
     byte[] versionsBytes = [];
 
     boolean cacheHit = false;
@@ -222,201 +313,110 @@ function buildLatestManifestResponse(string org, string name) returns http:Respo
         any|cache:Error cacheEntry = versionsListCache.get(listKey);
         if cacheEntry is string {
             versionsBytes = cacheEntry.toBytes();
-            log:printInfo("Versions list served from cache", org = org, name = name);
+            log:printDebug("Versions list served from cache", org = org, name = name);
             cacheHit = true;
         }
     }
 
     if !cacheHit {
-        string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name);
+        string[]|http:Response|error fetchResult = fetchVersionsFromCentral(org, name, distribution);
         if fetchResult is http:Response {
             return fetchResult;
         }
         if fetchResult is error {
-            log:printError("Failed fetching versions from central", 'error = fetchResult, org = org, name = name);
-            http:Response errResponse = new;
-            errResponse.statusCode = 502;
-            errResponse.setTextPayload("Failed to fetch from central: " + fetchResult.message());
-            return errResponse;
+            log:printError("Failed fetching versions from central", 'error = fetchResult, org = org, name = name,
+                    distribution = distribution);
+            return buildUpstreamErrorResponse();
         }
         if fetchResult.length() == 0 {
-            http:Response errResponse = new;
-            errResponse.statusCode = 502;
-            errResponse.setTextPayload("No versions available for package");
-            return errResponse;
+            http:Response notFound = new;
+            notFound.statusCode = 404;
+            notFound.setTextPayload(string `Package '${org}/${name}' has no published versions`, contentType = "text/plain");
+            return notFound;
         }
         string versionsJson = fetchResult.toJsonString();
         versionsBytes = versionsJson.toBytes();
-        cache:Error? cacheErr = versionsListCache.put(listKey, versionsJson, -1);
-        if cacheErr is cache:Error {
-            log:printWarn("Failed to cache versions list", org = org, name = name, 'error = cacheErr);
-        } else {
-            log:printInfo("Cached versions list", org = org, name = name);
-        }
+        cachePut(versionsListCache, listKey, versionsJson, "versions list");
     }
 
-    string digest = computeSha256Digest(versionsBytes);
-    cache:Error? cacheErr = blobCache.put(digest, versionsBytes, -1);
-    if cacheErr is cache:Error {
-        log:printWarn("Failed to cache versions blob", digest = digest, 'error = cacheErr);
-    }
-    cacheErr = blobSources.put(digest, listKey, -1);
-    if cacheErr is cache:Error {
-        log:printWarn("Failed to cache versions source", digest = digest, 'error = cacheErr);
-    }
-    log:printInfo("Built latest manifest", org = org, name = name, digest = digest);
-    return buildOciManifest(digest, versionsBytes.length());
+    string versionsDigest = computeSha256Digest(versionsBytes);
+    cachePut(blobCache, versionsDigest, versionsBytes, "versions blob");
+    IndexSource indexSource = {org, name, distribution};
+    cachePut(blobSources, versionsDigest, indexSource, "versions source");
+
+    string manifestText = buildOciManifestText(versionsDigest, versionsBytes.length());
+    string manifestDigest = computeSha256Digest(manifestText.toBytes());
+    cachePut(manifestsByDigest, manifestDigest, manifestText, "index manifest");
+    log:printDebug("Built index manifest", org = org, name = name, distribution = distribution,
+            digest = manifestDigest);
+    return buildManifestResponse(manifestDigest, manifestText);
 }
 
-// Fetches only the digest for a package version from Ballerina Central (no bala download).
-isolated function fetchVersionDigestFromCentral(string org, string name, string version) returns string|http:Response|error {
-    http:Response versionMetadataResponse = check centralClient->get(
-        string `/2.0/registry/packages/${org}/${name}/${version}`
-    );
-
-    if versionMetadataResponse.statusCode == 404 {
-        log:printInfo("Package not found in central", org = org, name = name, version = version);
-        http:Response notFound = new;
-        notFound.statusCode = 404;
-        notFound.setTextPayload(string `Package '${org}/${name}:${version}' does not exist`, contentType = "text/plain");
-        return notFound;
+function buildVersionManifest(string org, string name, string version)
+        returns VersionManifest|http:Response|error {
+    VersionMetadata|http:Response metadata = check resolveVersionMetadata(org, name, version);
+    if metadata is http:Response {
+        return metadata;
     }
-
-    json responsePayload = check versionMetadataResponse.getJsonPayload();
-    map<json> versionData = check responsePayload.cloneWithType();
-
-    string? rawDigest = getStringField(versionData, "digest");
-    if rawDigest is () {
-        return error("Central version metadata did not contain a digest field");
-    }
-
-    // Central returns "sha256=<hex>"; convert to OCI format "sha256:<hex>"
-    string ociDigest = re `sha-256=`.replaceAll(rawDigest, "sha256:");
-    log:printInfo("Fetched version digest from central", org = org, name = name, version = version, digest = ociDigest);
-    return ociDigest;
+    int balaSize = check fetchBalaSize(metadata.balaURL);
+    string manifestText = buildOciManifestText(metadata.digest, balaSize, metadata.platform,
+            metadata.distributionVersion, metadata.isDeprecated, metadata.deprecateMessage, metadata.modules);
+    VersionManifest manifest = {
+        manifestText,
+        manifestDigest: computeSha256Digest(manifestText.toBytes()),
+        layerDigest: metadata.digest,
+        layerSize: balaSize
+    };
+    cachePut(versionMetaCache, string `${org}/${name}/${version}`, manifest, "version manifest");
+    log:printDebug("Built version manifest", org = org, name = name, version = version,
+            digest = manifest.manifestDigest, platform = metadata.platform,
+            distributionVersion = metadata.distributionVersion, isDeprecated = metadata.isDeprecated);
+    return manifest;
 }
 
-// Builds the OCI manifest for a bala package (GET — uses Central digest, defers bala download to blob request).
-function buildVersionManifestResponse(string org, string name, string version) returns http:Response|error {
+function getVersionManifest(string org, string name, string version) returns VersionManifest|http:Response {
     string metaKey = string `${org}/${name}/${version}`;
-    string digest = "";
-    string balaURL = "";
-    string platform = "";
-    string distributionVersion = "";
-    boolean isDeprecated = false;
-    string deprecateMessage = "";
-    boolean cacheHit = false;
-
-    // Check metadata cache first to avoid redundant Central API calls
+    VersionManifest? cached = ();
     if versionMetaCache.hasKey(metaKey) {
         any|cache:Error metaEntry = versionMetaCache.get(metaKey);
-        string cached = metaEntry is string ? metaEntry : "";
-        string[] parts = re `\|`.split(cached);
-        // deprecateMessage is free text and may itself contain "|", so anything from the 6th
-        // field onward is rejoined back into the message rather than requiring an exact count.
-        if parts.length() >= 6 {
-            digest = parts[0];
-            balaURL = parts[1];
-            platform = parts[2];
-            distributionVersion = parts[3];
-            isDeprecated = parts[4] == "true";
-            deprecateMessage = parts[5];
-            foreach int i in 6 ..< parts.length() {
-                deprecateMessage = deprecateMessage + "|" + parts[i];
-            }
-            cacheHit = true;
-            log:printInfo("Version metadata served from cache", org = org, name = name, version = version, digest = digest);
-        }
-        // Otherwise a malformed or pre-upgrade cache entry — fall through to re-fetch.
-    }
-
-    if !cacheHit {
-        // Fetch balaURL/platform/distribution/deprecation status and digest from Central
-        VersionMetadata|http:Response|error metadataResult = resolveBalaURL(org, name, version);
-        if metadataResult is http:Response {
-            return metadataResult;
-        }
-        if metadataResult is error {
-            log:printError("Failed resolving balaURL", 'error = metadataResult, org = org, name = name, version = version);
-            http:Response errResponse = new;
-            errResponse.statusCode = 502;
-            errResponse.setTextPayload("Failed to resolve bala URL: " + metadataResult.message());
-            return errResponse;
-        }
-
-        string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
-        if digestResult is http:Response {
-            return digestResult;
-        }
-        if digestResult is error {
-            log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
-            http:Response errResponse = new;
-            errResponse.statusCode = 502;
-            errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
-            return errResponse;
-        }
-
-        digest = digestResult;
-        balaURL = metadataResult.balaURL;
-        platform = metadataResult.platform;
-        distributionVersion = metadataResult.distributionVersion;
-        isDeprecated = metadataResult.isDeprecated;
-        deprecateMessage = metadataResult.deprecateMessage;
-        // Store digest|balaURL|platform|distributionVersion|isDeprecated|deprecateMessage in cache
-        cache:Error? cacheErr = versionMetaCache.put(metaKey,
-                string `${digest}|${balaURL}|${platform}|${distributionVersion}|${isDeprecated.toString()}` +
-                        string `|${deprecateMessage}`, -1);
-        if cacheErr is cache:Error {
-            log:printWarn("Failed to cache version metadata", metaKey = metaKey, 'error = cacheErr);
-        } else {
-            log:printInfo("Cached version metadata", org = org, name = name, version = version, digest = digest);
+        if metaEntry is VersionManifest {
+            cached = metaEntry;
+            log:printDebug("Version manifest served from cache", org = org, name = name, version = version);
         }
     }
 
-    // Cache the source key and balaURL for the blob endpoint
-    cache:Error? cacheErr = blobSources.put(digest, metaKey, -1);
-    if cacheErr is cache:Error {
-        log:printWarn("Failed to cache blob source", digest = digest, 'error = cacheErr);
+    VersionManifest|http:Response|error result = cached is VersionManifest
+        ? cached : buildVersionManifest(org, name, version);
+    if result is error {
+        log:printError("Failed building version manifest", 'error = result, org = org, name = name, version = version);
+        return buildUpstreamErrorResponse();
     }
-    cacheErr = blobSources.put(string `url:${digest}`, balaURL, -1);
-    if cacheErr is cache:Error {
-        log:printWarn("Failed to cache balaURL", digest = digest, 'error = cacheErr);
-    }
-
-    // Record this manifest's own (self) digest so a later `GET referrers/{selfDigest}` — which
-    // only ever carries a digest, never org/name/version — can find its way back to this package.
-    // Must match buildOciManifest's own call below exactly, or the self-digest recorded here won't
-    // match what's actually served, breaking the referrers lookup.
-    string manifestText = buildOciManifestText(digest, 0, platform, distributionVersion, isDeprecated,
-            deprecateMessage);
-    string selfDigest = computeSha256Digest(manifestText.toBytes());
-    SubjectManifestInfo subjectInfo = {metaKey, size: manifestText.toBytes().length()};
-    cacheErr = subjectManifestSources.put(selfDigest, subjectInfo, -1);
-    if cacheErr is cache:Error {
-        log:printWarn("Failed to cache subject manifest source", digest = selfDigest, 'error = cacheErr);
+    if result is http:Response {
+        return result;
     }
 
-    log:printInfo("Built version manifest", org = org, name = name, version = version, digest = digest,
-            platform = platform, distributionVersion = distributionVersion, isDeprecated = isDeprecated);
-    return buildOciManifest(digest, 0, platform, distributionVersion, isDeprecated, deprecateMessage);
+    cachePut(blobSources, result.layerDigest, metaKey, "blob source");
+    // Referrers queries carry only the manifest digest — this is the only way back to org/name/version.
+    SubjectManifestInfo subjectInfo = {metaKey, size: result.manifestText.toBytes().length()};
+    cachePut(subjectManifestSources, result.manifestDigest, subjectInfo, "subject manifest source");
+    cachePut(manifestsByDigest, result.manifestDigest, result.manifestText, "version manifest by digest");
+    return result;
 }
 
-// Fetches the dependency graph for one package version from Central's dedicated
-// resolve-dependencies endpoint. This never downloads the bala — the graph is Central's own
-// small, purpose-built response, so there's nothing here worth caching beyond the referrer
-// artifact this produces (see buildDependencyGraphReferrer).
+function buildVersionManifestResponse(string org, string name, string version) returns http:Response {
+    VersionManifest|http:Response manifest = getVersionManifest(org, name, version);
+    if manifest is http:Response {
+        return manifest;
+    }
+    return buildManifestResponse(manifest.manifestDigest, manifest.manifestText);
+}
+
 isolated function fetchDependencyGraphFromCentral(string org, string name, string version)
         returns ResolvedPackage|http:Response|error {
-    // Central's own client (PackageResolutionRequest.addPackage) URL-encodes the version before
-    // sending it, to avoid the dash in pre-release tags tripping up its parsing — mirrored here.
-    string encodedVersion = check url:encode(version, "UTF-8");
     PackageResolutionRequest requestBody = {
-        packages: [{org, name, 'version: encodedVersion, mode: "hard"}]
+        packages: [{org, name, 'version: version, mode: "hard"}]
     };
 
-    // Central's real client (CentralAPIClient.getNewRequest) always sends these; resolve-dependencies
-    // uses Ballerina-Platform to pick compatible bala variants, and appears to reject requests
-    // that omit it.
     http:Request resolutionRequest = new;
     resolutionRequest.setJsonPayload(requestBody.toJson());
     resolutionRequest.setHeader("Ballerina-Platform", "any");
@@ -434,11 +434,8 @@ isolated function fetchDependencyGraphFromCentral(string org, string name, strin
             responseBody = textPayload;
         }
         log:printWarn("Central resolve-dependencies call failed", org = org, name = name, version = version,
-                status = resolutionResponse.statusCode, body = responseBody);
-        http:Response errResponse = new;
-        errResponse.statusCode = 502;
-        errResponse.setTextPayload("Failed to resolve dependency graph from central: " + responseBody);
-        return errResponse;
+                status = resolutionResponse.statusCode, body = truncateForLog(responseBody));
+        return buildUpstreamErrorResponse();
     }
 
     json responsePayload = check resolutionResponse.getJsonPayload();
@@ -449,7 +446,6 @@ isolated function fetchDependencyGraphFromCentral(string org, string name, strin
     return resolution.resolved[0];
 }
 
-// Builds the JSON text of a referrer manifest whose `subject` points at another manifest.
 isolated function buildDependencyGraphManifestText(string subjectDigest, int subjectSize,
         string layerDigest, int layerSize) returns string {
     return string `{
@@ -476,11 +472,6 @@ isolated function buildDependencyGraphManifestText(string subjectDigest, int sub
     }`;
 }
 
-// Returns the dependency-graph referrer for one package version, building and caching it on
-// first use. A cache hit skips the Central call entirely; a miss costs one small REST call
-// (never a bala download) and is bounded by depGraphMetaCache's normal capacity/TTL — there is
-// deliberately no "cache forever" here, since a miss is cheap enough not to need one.
-// Not `isolated`: it mutates the module-level caches, same as buildVersionManifestResponse.
 function buildDependencyGraphReferrer(string org, string name, string version,
         string subjectDigest, int subjectSize) returns ReferrerInfo|http:Response|error {
     if depGraphMetaCache.hasKey(subjectDigest) {
@@ -498,47 +489,25 @@ function buildDependencyGraphReferrer(string org, string name, string version,
         return resolved;
     }
 
-    byte[] graphBytes = resolved.toJsonString().toBytes();
+    // Shape must match bala's dependency-graph.json; `modules` must be present (client doesn't null-check it).
+    json dependencyGraphJson = {"packages": resolved.dependencyGraph.toJson(), "modules": []};
+    byte[] graphBytes = dependencyGraphJson.toJsonString().toBytes();
     string graphDigest = computeSha256Digest(graphBytes);
-    // Reuses the blob endpoint's existing blobCache-hit fast path — no blobSources entry needed.
-    cache:Error? cacheErr = blobCache.put(graphDigest, graphBytes, -1);
-    if cacheErr is cache:Error {
-        log:printWarn("Failed to cache dependency graph blob", digest = graphDigest, 'error = cacheErr);
-    }
+    cachePut(blobCache, graphDigest, graphBytes, "dependency graph blob");
 
     string manifestText = buildDependencyGraphManifestText(subjectDigest, subjectSize, graphDigest,
             graphBytes.length());
     byte[] manifestBytes = manifestText.toBytes();
     string manifestDigest = computeSha256Digest(manifestBytes);
-
-    cacheErr = referrerManifestCache.put(manifestDigest, manifestText, -1);
-    if cacheErr is cache:Error {
-        log:printWarn("Failed to cache dependency graph referrer manifest", digest = manifestDigest,
-                'error = cacheErr);
-    }
+    cachePut(manifestsByDigest, manifestDigest, manifestText, "dependency graph referrer manifest");
 
     ReferrerInfo referrerInfo = {manifestDigest, manifestSize: manifestBytes.length()};
-    cacheErr = depGraphMetaCache.put(subjectDigest, referrerInfo, -1);
-    if cacheErr is cache:Error {
-        log:printWarn("Failed to cache dependency graph referrer info", digest = subjectDigest, 'error = cacheErr);
-    }
-    log:printInfo("Built dependency graph referrer", org = org, name = name, version = version,
+    cachePut(depGraphMetaCache, subjectDigest, referrerInfo, "dependency graph referrer info");
+    log:printDebug("Built dependency graph referrer", org = org, name = name, version = version,
             manifestDigest = manifestDigest);
     return referrerInfo;
 }
 
-// Serves a manifest whose bytes are already known (a cached referrer manifest), verbatim.
-isolated function buildCachedManifestResponse(string digest, string manifestText) returns http:Response {
-    http:Response manifestResponse = new;
-    manifestResponse.statusCode = 200;
-    manifestResponse.setHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json");
-    manifestResponse.setHeader("Docker-Content-Digest", digest);
-    manifestResponse.setHeader("ETag", "\"" + digest + "\"");
-    manifestResponse.setTextPayload(manifestText, contentType = "application/vnd.oci.image.manifest.v1+json");
-    return manifestResponse;
-}
-
-// Builds the OCI image index returned by the referrers API.
 isolated function buildReferrersIndexResponse(ReferrerInfo[] referrers) returns http:Response {
     json[] manifestDescriptors = referrers.map(r => {
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -556,4 +525,36 @@ isolated function buildReferrersIndexResponse(ReferrerInfo[] referrers) returns 
     response.setHeader("Content-Type", "application/vnd.oci.image.index.v1+json");
     response.setJsonPayload(index);
     return response;
+}
+
+function getManifestByDigest(string reference) returns http:Response? {
+    if !reference.startsWith("sha256:") || !manifestsByDigest.hasKey(reference) {
+        return ();
+    }
+    any|cache:Error cachedManifest = manifestsByDigest.get(reference);
+    return cachedManifest is string ? buildManifestResponse(reference, cachedManifest) : ();
+}
+
+// Re-fetches from Central on cache miss; returns 404 if the list changed (digest mismatch).
+function serveIndexBlob(IndexSource indexSource, string digest) returns http:Response {
+    string[]|http:Response|error versionsResult = fetchVersionsFromCentral(indexSource.org, indexSource.name,
+            indexSource.distribution);
+    if versionsResult is http:Response {
+        return versionsResult;
+    }
+    if versionsResult is error {
+        log:printError("Failed fetching versions from central", 'error = versionsResult, org = indexSource.org,
+                name = indexSource.name, distribution = indexSource.distribution);
+        return buildUpstreamErrorResponse();
+    }
+
+    byte[] versionsBytes = versionsResult.toJsonString().toBytes();
+    if computeSha256Digest(versionsBytes) != digest {
+        log:printDebug("Versions list changed since its manifest was built", org = indexSource.org,
+                name = indexSource.name, distribution = indexSource.distribution, digest = digest);
+        return buildRegistryErrorResponse(404, "BLOB_UNKNOWN", "version list has changed");
+    }
+    cachePut(blobCache, digest, versionsBytes, "versions blob");
+    log:printDebug("Serving versions blob", digest = digest, size = versionsBytes.length());
+    return buildBlobResponse(versionsBytes, digest, "application/octet-stream");
 }

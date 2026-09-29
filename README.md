@@ -40,7 +40,7 @@ What Harbor gets: A registry-style response that confirms the version manifest i
 
 Purpose: Returns the actual bytes referenced by a manifest digest.
 
-How it works: If the digest belongs to the version index, the adapter returns the JSON version list. If the digest belongs to a package version, the adapter resolves the Bala URL from Central metadata and streams the `.bala` bytes back to Harbor.
+How it works: If the digest belongs to the version index, the adapter returns the JSON version list. If the digest belongs to a package version, the adapter resolves a fresh, presigned Bala URL from Central and redirects (`307`) to it, so Harbor downloads the `.bala` straight from Central's CDN, the way registries backed by object storage redirect their blobs. The adapter never relays or buffers bala bytes itself.
 
 What Harbor gets: The content-addressable payload that the manifest advertised, which Harbor can store, cache, and serve as an OCI blob.
 
@@ -62,3 +62,78 @@ What Harbor gets: A lightweight existence check for the content-addressed blob.
 
 This flow lets Harbor act as the registry layer while Ballerina Central remains the package source of truth.
 
+
+## Configuration
+
+All settings are `configurable` (see `config.bal`); the defaults below apply when `Config.toml` omits them.
+
+```toml
+port = 8080
+
+centralUrl = "https://api.central.ballerina.io"
+centralTimeout = 30                 # seconds
+centralMaxActiveConnections = 100
+centralMaxIdleConnections = 20
+centralPoolWaitTime = 30            # seconds
+
+balaCdnTimeout = 30                 # seconds, HEAD to the bala CDN for sizes
+
+# Each cache: capacity (entries), maxAge and cleanupInterval (seconds), optional evictionFactor (default 0.2)
+[blobCacheSettings]
+capacity = 200
+maxAge = 600
+cleanupInterval = 60
+
+[blobSourcesSettings]
+capacity = 500
+maxAge = 600
+cleanupInterval = 60
+
+[versionMetaCacheSettings]
+capacity = 1000
+maxAge = 1800
+cleanupInterval = 120
+
+[versionsListCacheSettings]
+capacity = 500
+maxAge = 300
+cleanupInterval = 60
+
+[depGraphMetaCacheSettings]
+capacity = 1000
+maxAge = 1800
+cleanupInterval = 120
+
+[manifestsByDigestSettings]
+capacity = 1000
+maxAge = 1800
+cleanupInterval = 120
+
+[subjectManifestSourcesSettings]
+capacity = 1000
+maxAge = 1800
+cleanupInterval = 120
+```
+
+A cache table must set `capacity`, `maxAge` and `cleanupInterval` together if it is overridden.
+
+## Production Logging
+
+Request-level details (`Received ...`, cache hits, manifest builds) are logged at `DEBUG`. At `INFO`, the adapter logs only warnings and failures, and per-request lines come from the HTTP access log. Upstream failures return a generic `502` to the client; the cause is logged.
+
+`Config.toml` is git-ignored, so supply it at deploy time:
+
+```toml
+[ballerina.log]
+level = "INFO"        # DEBUG for troubleshooting
+format = "json"
+
+[ballerina.http.accessLogConfig]
+console = true        # method, path, status, latency per request
+
+[ballerina.observe]
+tracingEnabled = true
+tracingProvider = "jaeger"   # also requires `import ballerinax/jaeger as _;`
+```
+
+With tracing enabled, every log line carries `traceId`/`spanId`, which correlates the lines of one request.

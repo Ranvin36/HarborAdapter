@@ -2,40 +2,36 @@ import ballerina/cache;
 import ballerina/http;
 import ballerina/log;
 
-final http:Client centralClient = check new ("https://api.central.ballerina.io", {
-    timeout: 30,
+final http:Client centralClient = check new (centralUrl, {
+    timeout: centralTimeout,
     poolConfig: {
-        maxActiveConnections: 100,
-        maxIdleConnections: 20,
-        waitTime: 30
+        maxActiveConnections: centralMaxActiveConnections,
+        maxIdleConnections: centralMaxIdleConnections,
+        waitTime: centralPoolWaitTime
     }
 });
 
 final string OCI_EMPTY_CONFIG_DIGEST = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
-// Blob cache: digest -> bytes, TTL 10 min, max 200 entries
-final cache:Cache blobCache = new (capacity = 200, evictionFactor = 0.2, defaultMaxAge = 600, cleanupInterval = 60);
-// Blob source lookup: digest -> "org/name" or "org/name/version", TTL 10 min
-final cache:Cache blobSources = new (capacity = 500, evictionFactor = 0.2, defaultMaxAge = 600, cleanupInterval = 60);
-// Version metadata cache: "org/name/version" -> "digest|balaURL", TTL 30 min
-final cache:Cache versionMetaCache = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
-// Versions list cache: "org/name" -> JSON string of versions array, TTL 5 min
-final cache:Cache versionsListCache = new (capacity = 500, evictionFactor = 0.2, defaultMaxAge = 300, cleanupInterval = 60);
-// Dependency graph referrer metadata: subject (version manifest) digest -> ReferrerInfo, TTL 30 min.
-// A cache hit here means Central's resolve-dependencies call is skipped entirely.
-final cache:Cache depGraphMetaCache = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
-// Referrer manifest bytes: referrer manifest digest -> manifest JSON text, TTL 30 min
-final cache:Cache referrerManifestCache = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
-// Version manifest self-digest -> SubjectManifestInfo{org/name/version, manifest size}. Populated
-// whenever a version manifest is built, since a referrers query only ever carries that digest and
-// there is no other way to recover which package it belongs to. Same TTL as versionMetaCache so
-// the two rise and fall together (see the HEAD-manifest/blobSources TTL note on that cache).
-final cache:Cache subjectManifestSources = new (capacity = 1000, evictionFactor = 0.2, defaultMaxAge = 1800, cleanupInterval = 120);
+// digest -> byte[]
+final cache:Cache blobCache = newCache(blobCacheSettings);
+// digest -> IndexSource | "org/name/version"
+final cache:Cache blobSources = newCache(blobSourcesSettings);
+// "org/name/version" -> VersionManifest
+final cache:Cache versionMetaCache = newCache(versionMetaCacheSettings);
+// "org/name@distribution" -> versions JSON string
+final cache:Cache versionsListCache = newCache(versionsListCacheSettings);
+// subject manifest digest -> ReferrerInfo
+final cache:Cache depGraphMetaCache = newCache(depGraphMetaCacheSettings);
+// manifest digest -> manifest JSON text
+final cache:Cache manifestsByDigest = newCache(manifestsByDigestSettings);
+// version manifest digest -> SubjectManifestInfo
+final cache:Cache subjectManifestSources = newCache(subjectManifestSourcesSettings);
 
-service / on new http:Listener(8080) {
+service / on new http:Listener(port) {
     // GET /v2
     resource function get v2() returns http:Response {
-        log:printInfo("Received request for /v2/");
+        log:printDebug("Received request for /v2/");
         http:Response v2Response = new;
         v2Response.statusCode = 200;
         v2Response.setHeader("Docker-Distribution-API-Version", "2.0");
@@ -52,135 +48,81 @@ service / on new http:Listener(8080) {
 
     // GET /v2/{org}/{name}/manifests/latest
     resource function get v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
-        log:printInfo("Received GET latest manifest request", org = org, name = name);
-        return buildLatestManifestResponse(org, name);
+        log:printDebug("Received GET latest manifest request", org = org, name = name);
+        return buildIndexManifestResponse(org, name);
     }
 
     // HEAD /v2/{org}/{name}/manifests/latest
     resource function head v2/[string org]/[string name]/manifests/latest() returns http:Response|error {
-        log:printInfo("Received HEAD latest manifest request", org = org, name = name);
-        // Use cached versions JSON to compute digest without a full manifest build
-        string listKey = string `${org}/${name}`;
-        string digest = "";
-        if versionsListCache.hasKey(listKey) {
-            any|cache:Error cacheEntry = versionsListCache.get(listKey);
-            if cacheEntry is string {
-                digest = computeSha256Digest(cacheEntry.toBytes());
-            }
+        log:printDebug("Received HEAD latest manifest request", org = org, name = name);
+        http:Response|error latestResponse = buildIndexManifestResponse(org, name);
+        if latestResponse is error {
+            return latestResponse;
         }
-        if digest == "" {
-            // Cache miss — do a full build to populate caches and get the digest
-            http:Response|error manifestResponse = buildLatestManifestResponse(org, name);
-            if manifestResponse is error {
-                return manifestResponse;
-            }
-            string|http:HeaderNotFoundError digestHeader = manifestResponse.getHeader("Docker-Content-Digest");
-            digest = digestHeader is string ? digestHeader : "";
-        }
-        http:Response headResponse = new;
-        headResponse.statusCode = 200;
-        headResponse.setHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json");
-        headResponse.setHeader("Docker-Content-Digest", digest);
-        headResponse.setHeader("ETag", "\"" + digest + "\"");
-        return headResponse;
+        return toHeadResponse(latestResponse);
     }
 
     // GET /v2/{org}/{name}/{platform}/manifests/{version} — test endpoint
     resource function get v2/[string org]/[string name]/[string platform]/manifests/[string version]() returns http:Response {
-        log:printInfo("Received 3-segment manifest request", org = org, name = name, platform = platform, version = version);
+        log:printDebug("Received 3-segment manifest request", org = org, name = name, platform = platform, version = version);
         http:Response testResponse = new;
         testResponse.statusCode = 200;
         testResponse.setTextPayload("ok");
         return testResponse;
     }
     resource function head v2/[string org]/[string name]/[string platform]/manifests/[string version]() returns http:Response {
-        log:printInfo("Received 3-segment manifest request", org = org, name = name, platform = platform, version = version);
+        log:printDebug("Received 3-segment manifest request", org = org, name = name, platform = platform, version = version);
         http:Response testResponse = new;
         testResponse.statusCode = 200;
         testResponse.setTextPayload("ok");
         return testResponse;
     }
 
-    // GET /v2/{org}/{name}/manifests/{version}
-    resource function get v2/[string org]/[string name]/manifests/[string version](http:Request req) returns http:Response|error {
-        string[] headerNames = req.getHeaderNames();
-        foreach string headerName in headerNames {
-            string|http:HeaderNotFoundError headerValue = req.getHeader(headerName);
-            if headerValue is string {
-                log:printInfo("Request header", name = headerName, value = headerValue);
-            }
+    resource function get v2/[string org]/[string name]/manifests/[string version]() returns http:Response|error {
+        http:Response? byDigest = getManifestByDigest(version);
+        if byDigest is http:Response {
+            log:printDebug("Serving manifest by digest", digest = version);
+            return byDigest;
         }
-        // A referrer manifest (e.g. the dependency-graph artifact) is requested by its own
-        // digest, not a version tag — serve it straight from cache if that's what this is.
-        if referrerManifestCache.hasKey(version) {
-            any|cache:Error cachedManifest = referrerManifestCache.get(version);
-            if cachedManifest is string {
-                log:printInfo("Serving cached referrer manifest", digest = version);
-                return buildCachedManifestResponse(version, cachedManifest);
-            }
+        if version.startsWith("sha256:") {
+            return buildRegistryErrorResponse(404, "MANIFEST_UNKNOWN", "manifest unknown to registry");
         }
-
-        log:printInfo("Received GET manifest request", org = org, name = name, version = version);
+        string? distribution = indexTagToDistribution(version);
+        if distribution is string {
+            log:printDebug("Received GET index manifest request", org = org, name = name, distribution = distribution);
+            return buildIndexManifestResponse(org, name, distribution);
+        }
+        log:printDebug("Received GET manifest request", org = org, name = name, version = version);
         return buildVersionManifestResponse(org, name, version);
     }
 
     // HEAD /v2/{org}/{name}/manifests/{version}
     resource function head v2/[string org]/[string name]/manifests/[string version]() returns http:Response|error {
-        log:printInfo("Received HEAD manifest request", org = org, name = name, version = version);
-
-        if referrerManifestCache.hasKey(version) {
-            any|cache:Error cachedManifest = referrerManifestCache.get(version);
-            if cachedManifest is string {
-                return buildCachedManifestResponse(version, cachedManifest);
-            }
+        log:printDebug("Received HEAD manifest request", org = org, name = name, version = version);
+        http:Response? byDigest = getManifestByDigest(version);
+        if byDigest is http:Response {
+            return toHeadResponse(byDigest);
         }
-
-        // Check metadata cache first to avoid a live Central call
-        string metaKey = string `${org}/${name}/${version}`;
-        string digest = "";
-        if versionMetaCache.hasKey(metaKey) {
-            any|cache:Error metaEntry = versionMetaCache.get(metaKey);
-            if metaEntry is string {
-                int? sepIdxOpt = metaEntry.indexOf("|");
-                int sepIdx = sepIdxOpt is int ? sepIdxOpt : -1;
-                if sepIdx > 0 {
-                    digest = metaEntry.substring(0, sepIdx);
-                }
-            }
+        if version.startsWith("sha256:") {
+            return buildRegistryErrorResponse(404, "MANIFEST_UNKNOWN", "manifest unknown to registry");
         }
-        if digest == "" {
-            string|http:Response|error digestResult = fetchVersionDigestFromCentral(org, name, version);
-            if digestResult is http:Response {
-                return digestResult;
+        string? distribution = indexTagToDistribution(version);
+        if distribution is string {
+            http:Response|error indexResponse = buildIndexManifestResponse(org, name, distribution);
+            if indexResponse is error {
+                return indexResponse;
             }
-            if digestResult is error {
-                log:printError("Failed fetching version digest", 'error = digestResult, org = org, name = name, version = version);
-                http:Response errResponse = new;
-                errResponse.statusCode = 502;
-                errResponse.setTextPayload("Failed to fetch version digest: " + digestResult.message());
-                return errResponse;
-            }
-            digest = digestResult;
+            return toHeadResponse(indexResponse);
         }
-        http:Response headResponse = new;
-        headResponse.statusCode = 200;
-        headResponse.setHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json");
-        headResponse.setHeader("Docker-Content-Digest", digest);
-        headResponse.setHeader("ETag", "\"" + digest + "\"");
-        return headResponse;
+        return toHeadResponse(buildVersionManifestResponse(org, name, version));
     }
 
-    // GET /v2/{org}/{name}/referrers/{digest} — OCI Distribution Spec referrers API.
-    // `digest` is a version manifest's own (self) digest, discovered by the caller from a prior
-    // manifest GET/HEAD. Currently the only referrer type this adapter publishes is the
-    // dependency graph, fetched from Central's resolve-dependencies endpoint (never the bala).
     resource function get v2/[string org]/[string name]/referrers/[string digest](http:Request req)
             returns http:Response|error {
-        log:printInfo("Received GET referrers request", org = org, name = name, digest = digest);
+        log:printDebug("Received GET referrers request", org = org, name = name, digest = digest);
         string? artifactTypeFilter = req.getQueryParamValue("artifactType");
 
         if !subjectManifestSources.hasKey(digest) {
-            // Unknown subject digest — an empty index is the spec-correct response, not a 404.
             return buildReferrersIndexResponse([]);
         }
         any|cache:Error subjectEntry = subjectManifestSources.get(digest);
@@ -200,31 +142,78 @@ service / on new http:Listener(8080) {
 
         ReferrerInfo|http:Response|error referrerResult = buildDependencyGraphReferrer(
                 parts[0], parts[1], parts[2], digest, subjectEntry.size);
-        if referrerResult is http:Response {
-            return referrerResult;
-        }
         if referrerResult is error {
             log:printWarn("Failed to build dependency graph referrer", 'error = referrerResult,
                     org = parts[0], name = parts[1], version = parts[2]);
             return buildReferrersIndexResponse([]);
         }
+        if referrerResult is http:Response {
+            log:printWarn("Upstream error building dependency graph referrer",
+                    org = parts[0], name = parts[1], version = parts[2], status = referrerResult.statusCode);
+            return buildReferrersIndexResponse([]);
+        }
         return buildReferrersIndexResponse([referrerResult]);
     }
 
-    // HEAD /v2/{org}/{name}/blobs/{digest}
-    resource function head v2/[string org]/[string name]/blobs/[string digest]() returns http:Response {
-        log:printInfo("Received HEAD request for blob", org = org, name = name, digest = digest);
-        // All digests we issue are valid — always acknowledge existence
-        http:Response headResponse = new;
-        headResponse.statusCode = 200;
-        headResponse.setHeader("Content-Type", "application/octet-stream");
-        headResponse.setHeader("Docker-Content-Digest", digest);
-        return headResponse;
+    resource function head v2/[string org]/[string name]/blobs/[string digest]() returns http:Response|error {
+        log:printDebug("Received HEAD request for blob", org = org, name = name, digest = digest);
+
+        if digest == OCI_EMPTY_CONFIG_DIGEST {
+            http:Response headResponse = new;
+            headResponse.statusCode = 200;
+            headResponse.setHeader("Content-Type", "application/vnd.oci.image.config.v1+json");
+            headResponse.setHeader("Docker-Content-Digest", digest);
+            headResponse.setHeader("Content-Length", "2");
+            return headResponse;
+        }
+
+        if blobCache.hasKey(digest) {
+            any|cache:Error cacheEntry = blobCache.get(digest);
+            if cacheEntry is byte[] {
+                http:Response headResponse = new;
+                headResponse.statusCode = 200;
+                headResponse.setHeader("Content-Type", "application/octet-stream");
+                headResponse.setHeader("Docker-Content-Digest", digest);
+                headResponse.setHeader("Content-Length", cacheEntry.length().toString());
+                return headResponse;
+            }
+        }
+
+        if blobSources.hasKey(digest) {
+            any|cache:Error sourceEntry = blobSources.get(digest);
+            if sourceEntry is IndexSource {
+                // Size unknown without re-fetching; return 200 without Content-Length.
+                http:Response headResponse = new;
+                headResponse.statusCode = 200;
+                headResponse.setHeader("Content-Type", "application/octet-stream");
+                headResponse.setHeader("Docker-Content-Digest", digest);
+                return headResponse;
+            }
+            if sourceEntry is string {
+                // "org/name/version" — look up the cached manifest for the layer size.
+                any|cache:Error manifestEntry = versionMetaCache.get(sourceEntry);
+                if manifestEntry is VersionManifest {
+                    http:Response headResponse = new;
+                    headResponse.statusCode = 200;
+                    headResponse.setHeader("Content-Type", "application/octet-stream");
+                    headResponse.setHeader("Docker-Content-Digest", digest);
+                    headResponse.setHeader("Content-Length", manifestEntry.layerSize.toString());
+                    return headResponse;
+                }
+                // Manifest evicted — still a known digest, just no cached size.
+                http:Response headResponse = new;
+                headResponse.statusCode = 200;
+                headResponse.setHeader("Content-Type", "application/octet-stream");
+                headResponse.setHeader("Docker-Content-Digest", digest);
+                return headResponse;
+            }
+        }
+
+        return buildRegistryErrorResponse(404, "BLOB_UNKNOWN", "blob unknown to registry");
     }
 
-    // GET /v2/{org}/{name}/blobs/{digest}
     resource function get v2/[string org]/[string name]/blobs/[string digest]() returns http:Response|error {
-        log:printInfo("Received request for blob", org = org, name = name, digest = digest);
+        log:printDebug("Received request for blob", org = org, name = name, digest = digest);
 
         if digest == OCI_EMPTY_CONFIG_DIGEST {
             http:Response configResponse = new;
@@ -233,117 +222,63 @@ service / on new http:Listener(8080) {
             return configResponse;
         }
 
-        // Return from cache if already fetched
         if blobCache.hasKey(digest) {
             any|cache:Error cacheEntry = blobCache.get(digest);
             if cacheEntry is byte[] {
-                log:printInfo("Serving blob from cache", digest = digest);
+                log:printDebug("Serving blob from cache", digest = digest);
                 return buildBlobResponse(cacheEntry.clone(), digest, "application/octet-stream");
             }
         }
 
+        IndexSource? indexSource = ();
         string? sourceKey = ();
         if blobSources.hasKey(digest) {
             any|cache:Error sourceEntry = blobSources.get(digest);
-            if sourceEntry is string {
+            if sourceEntry is IndexSource {
+                indexSource = sourceEntry;
+            } else if sourceEntry is string {
                 sourceKey = sourceEntry;
             }
         }
-        log:printInfo("Source key for digest", sourceKey = sourceKey);
+        if indexSource is IndexSource {
+            return serveIndexBlob(indexSource, digest);
+        }
         if sourceKey is () {
-            log:printError("Unknown blob digest", digest = digest);
-            http:Response notFound = new;
-            notFound.statusCode = 404;
-            notFound.setTextPayload("{\"errors\":[{\"code\":\"BLOB_UNKNOWN\"}]}", contentType = "application/json");
-            return notFound;
+            log:printWarn("Unknown blob digest", digest = digest);
+            return buildRegistryErrorResponse(404, "BLOB_UNKNOWN", "blob unknown to registry");
         }
 
         string[] parts = re `/`.split(sourceKey);
 
-        if parts.length() == 2 {
-            // "org/name" — serve versions JSON
-            string decodedOrg = parts[0];
-            string decodedName = parts[1];
-            log:printInfo("Serving versions blob", org = decodedOrg, name = decodedName);
-
-            string[]|http:Response|error versionsResult = fetchVersionsFromCentral(decodedOrg, decodedName);
-            if versionsResult is http:Response {
-                return versionsResult;
-            }
-            if versionsResult is error {
-                log:printError("Failed fetching versions", 'error = versionsResult);
-                http:Response errResponse = new;
-                errResponse.statusCode = 502;
-                errResponse.setTextPayload("Failed to fetch versions: " + versionsResult.message());
-                return errResponse;
-            }
-
-            byte[] versionsBytes = versionsResult.toJsonString().toBytes();
-            // Use the digest Harbor requested — it was advertised in the manifest
-            cache:Error? cacheErr = blobCache.put(digest, versionsBytes, -1);
-            if cacheErr is cache:Error {
-                log:printWarn("Failed to cache versions blob", digest = digest, 'error = cacheErr);
-            }
-            log:printInfo("Serving versions blob", digest = digest, size = versionsBytes.length());
-            return buildBlobResponse(versionsBytes, digest, "application/octet-stream");
-
-        } else if parts.length() == 3 {
-            // "org/name/version" — serve bala bytes
+        if parts.length() == 3 {
             string decodedOrg = parts[0];
             string decodedName = parts[1];
             string decodedVersion = parts[2];
-            log:printInfo("Serving bala blob", org = decodedOrg, name = decodedName, version = decodedVersion);
-
-            // Use cached balaURL if available (set by buildVersionManifestResponse)
-            string balaURL = "";
-            string urlKey = string `url:${digest}`;
-            if blobSources.hasKey(urlKey) {
-                any|cache:Error urlEntry = blobSources.get(urlKey);
-                if urlEntry is string {
-                    balaURL = urlEntry;
-                    log:printInfo("Using cached balaURL", digest = digest);
-                }
+            log:printDebug("Serving bala blob", org = decodedOrg, name = decodedName, version = decodedVersion);
+            VersionMetadata|http:Response|error metadataResult =
+                    resolveVersionMetadata(decodedOrg, decodedName, decodedVersion);
+            if metadataResult is http:Response {
+                return metadataResult;
             }
-            if balaURL == "" {
-                // Fall back to re-fetching metadata from Central
-                VersionMetadata|http:Response|error metadataResult =
-                        resolveBalaURL(decodedOrg, decodedName, decodedVersion);
-                if metadataResult is http:Response {
-                    return metadataResult;
-                }
-                if metadataResult is error {
-                    log:printError("Failed resolving balaURL", 'error = metadataResult);
-                    http:Response errResponse = new;
-                    errResponse.statusCode = 502;
-                    errResponse.setTextPayload("Failed to resolve bala URL: " + metadataResult.message());
-                    return errResponse;
-                }
-                balaURL = metadataResult.balaURL;
+            if metadataResult is error {
+                log:printError("Failed resolving balaURL", 'error = metadataResult, org = decodedOrg,
+                        name = decodedName, version = decodedVersion);
+                return buildUpstreamErrorResponse();
             }
-
-            byte[]|error balaBytes = downloadBalaBytes(balaURL);
-            if balaBytes is error {
-                log:printError("Failed downloading bala", 'error = balaBytes);
-                http:Response errResponse = new;
-                errResponse.statusCode = 502;
-                errResponse.setTextPayload("Failed to download bala: " + balaBytes.message());
-                return errResponse;
+            if metadataResult.digest != digest {
+                log:printWarn("Bala digest reported by central no longer matches", expected = digest,
+                        actual = metadataResult.digest, org = decodedOrg, name = decodedName, version = decodedVersion);
+                return buildRegistryErrorResponse(404, "BLOB_UNKNOWN", "blob unknown to registry");
             }
-
-            // Use the digest Harbor requested — it was advertised in the manifest
-            cache:Error? cacheErr = blobCache.put(digest, balaBytes, -1);
-            if cacheErr is cache:Error {
-                log:printWarn("Failed to cache bala blob", digest = digest, 'error = cacheErr);
-            }
-            log:printInfo("Serving bala blob", digest = digest, size = balaBytes.length());
-            return buildBlobResponse(balaBytes, digest, "application/octet-stream");
-
+            http:Response redirect = new;
+            redirect.statusCode = 307;
+            redirect.setHeader("Location", metadataResult.balaURL);
+            redirect.setHeader("Docker-Content-Digest", digest);
+            log:printDebug("Redirecting to bala download", digest = digest);
+            return redirect;
         } else {
             log:printError("Unexpected blob source format", sourceKey = sourceKey);
-            http:Response notFound = new;
-            notFound.statusCode = 404;
-            notFound.setTextPayload("{\"errors\":[{\"code\":\"BLOB_UNKNOWN\"}]}", contentType = "application/json");
-            return notFound;
+            return buildRegistryErrorResponse(404, "BLOB_UNKNOWN", "blob unknown to registry");
         }
     }
 }
